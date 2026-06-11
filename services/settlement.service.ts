@@ -50,7 +50,6 @@ export function settleAsync(ch: Challenge): SettlementReceipt | null {
   ch.resultType = reason === 'TIE' ? 'DRAW' : 'WIN';
 
   if (reason === 'TIE') {
-    // Refund each side — no fees on draws
     if (ch.creatorUid) escrowCredit(ch.creatorUid, ch.escrowedCreator ?? 0);
     if (ch.opponentUid) escrowCredit(ch.opponentUid, ch.escrowedOpponent ?? 0);
     return finalize(ch, { pot, winnerUid: null, winnerAmount: 0, developerAmount: 0, protocolAmount: 0, reason });
@@ -65,8 +64,7 @@ export function settleAsync(ch: Challenge): SettlementReceipt | null {
 }
 
 /**
- * Settle Connect 4 — winnerUid already determined by game.service via
- * commitAuthoritativeMove. We just pay out.
+ * Settle Connect 4 — winnerUid already determined by game.service.
  */
 export function settleConnect4(ch: Challenge): SettlementReceipt | null {
   if (ch.settled) return existingReceipt(ch);
@@ -90,7 +88,7 @@ export function settleConnect4(ch: Challenge): SettlementReceipt | null {
 }
 
 /**
- * Refund creator when challenge expired without opponent.
+ * Refund creator when challenge expired without any opponent accepting.
  */
 export function settleExpiredRefund(ch: Challenge): SettlementReceipt | null {
   if (ch.settled) return existingReceipt(ch);
@@ -105,7 +103,43 @@ export function settleExpiredRefund(ch: Challenge): SettlementReceipt | null {
 }
 
 /**
- * Forfeit — one player no-showed. Present player gets the pot minus fees.
+ * FIX BUG 7: No-show during join window — both players are refunded in full.
+ * No fees are taken. This honours connect4Policy.noShowPolicy === 'REFUND_BOTH'.
+ *
+ * Called by checkAndAdjudicate when joinDeadlineAt expires and at least one
+ * player has not called joinMatch(). The previous code incorrectly called
+ * settleForfeit() here, which punished the absent player even though the
+ * policy explicitly says REFUND_BOTH.
+ */
+export function settleNoShow(ch: Challenge): SettlementReceipt | null {
+  if (ch.settled) return existingReceipt(ch);
+
+  // Full refund to each side — no fees on no-shows
+  if (ch.creatorUid && ch.escrowedCreator) {
+    escrowCredit(ch.creatorUid, ch.escrowedCreator);
+  }
+  if (ch.opponentUid && ch.escrowedOpponent) {
+    escrowCredit(ch.opponentUid, ch.escrowedOpponent);
+  }
+
+  // Use a distinct status so the UI can display the correct message
+  (ch as any).status = 'BOTH_REFUNDED';
+
+  const pot = (ch.escrowedCreator ?? 0) + (ch.escrowedOpponent ?? 0);
+  return finalize(ch, {
+    pot,
+    winnerUid: null,
+    winnerAmount: 0,
+    developerAmount: 0,
+    protocolAmount: 0,
+    reason: 'NO_SHOW_REFUND',
+  });
+}
+
+/**
+ * Forfeit — one player ran out of time mid-game (turn timeout).
+ * The present player receives the pot minus fees.
+ * NOTE: this is NOT called on join-window no-show — see settleNoShow above.
  */
 export function settleForfeit(ch: Challenge, forfeitUid: string): SettlementReceipt | null {
   if (ch.settled) return existingReceipt(ch);
@@ -127,7 +161,17 @@ export function settleForfeit(ch: Challenge, forfeitUid: string): SettlementRece
   return finalize(ch, { pot, winnerUid: winnerUid ?? null, winnerAmount, developerAmount, protocolAmount, reason: 'FORFEIT' });
 }
 
-function finalize(ch: Challenge, parts: { pot: number; winnerUid: string | null; winnerAmount: number; developerAmount: number; protocolAmount: number; reason: string }): SettlementReceipt {
+function finalize(
+  ch: Challenge,
+  parts: {
+    pot: number;
+    winnerUid: string | null;
+    winnerAmount: number;
+    developerAmount: number;
+    protocolAmount: number;
+    reason: string;
+  }
+): SettlementReceipt {
   const txId = buildTxId('settle', ch.code);
   const finalizedAt = Date.now();
 
@@ -142,9 +186,17 @@ function finalize(ch: Challenge, parts: { pot: number; winnerUid: string | null;
     reason: parts.reason as any,
     finalizedAt,
   };
-  if (ch.status !== 'CREATOR_REFUNDED' && ch.status !== 'PRESENT_PLAYER_PAID') {
+
+  const terminalStatusesSetElsewhere = [
+    'CREATOR_REFUNDED',
+    'PRESENT_PLAYER_PAID',
+    'BOTH_REFUNDED',
+  ] as string[];
+
+  if (!terminalStatusesSetElsewhere.includes((ch as any).status)) {
     ch.status = 'SETTLED';
   }
+
   writeChallenge(ch);
 
   return {

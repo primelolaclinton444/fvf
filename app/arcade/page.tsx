@@ -1,31 +1,85 @@
 'use client';
 import Link from 'next/link';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
+import { useWallet } from '@/contexts/WalletContext';
 import { Shell } from '@/components/ui/Shell';
 import { GameCard } from '@/components/ui/GameCard';
 import { listChallenges, hydrateChallengeFromInvite } from '@/services/challenge.service';
+import { checkAndAdjudicate } from '@/services/game.service';
+import { subscribe } from '@/lib/realtime';
 import type { Challenge } from '@/types/challenge';
+
+const TERMINAL = new Set([
+  'SETTLED',
+  'CREATOR_REFUNDED',
+  'PRESENT_PLAYER_PAID',
+  'BOTH_REFUNDED',
+  'EXPIRED',
+]);
+
+// What does this challenge want from the player right now?
+function action(ch: Challenge, uid: string, now: number): { label: string; tone: 'urgent' | 'wait' | 'go' } {
+  const isCreator = ch.creatorUid === uid;
+  switch (ch.status) {
+    case 'AWAITING_OPPONENT':
+      return now > ch.expiresAt
+        ? { label: 'Expired — reclaim stake', tone: 'urgent' }
+        : { label: 'Waiting for opponent', tone: 'wait' };
+    case 'FULLY_FUNDED':
+    case 'JOIN_WINDOW_STARTED': {
+      const youIn = isCreator ? ch.creatorJoined : ch.opponentJoined;
+      return youIn ? { label: 'Waiting for opponent to enter', tone: 'wait' } : { label: 'Enter match now', tone: 'urgent' };
+    }
+    case 'MATCH_ACTIVE':
+      if (ch.gameType === 'CONNECT4') {
+        if (ch.phase === 'IN_PROGRESS') return { label: ch.currentTurnUid === uid ? 'Your turn' : "Opponent's turn", tone: ch.currentTurnUid === uid ? 'urgent' : 'wait' };
+        return { label: 'Ready up', tone: 'urgent' };
+      } else {
+        const youDone = isCreator ? ch.creatorResult : ch.opponentResult;
+        return youDone ? { label: 'Waiting for opponent', tone: 'wait' } : { label: 'Play your run', tone: 'urgent' };
+      }
+    default:
+      return { label: 'Resume', tone: 'go' };
+  }
+}
 
 export default function ArcadePage() {
   const { uid } = useAuth();
+  const { refresh } = useWallet();
   const [code, setCode] = useState('');
   const [active, setActive] = useState<Challenge[]>([]);
+  const [now, setNow] = useState(Date.now());
 
-  useEffect(() => {
-    if (uid) {
-      setActive(
-        listChallenges(uid).filter(
-          c =>
-            c.status !== 'SETTLED' &&
-            c.status !== 'CREATOR_REFUNDED' &&
-            c.status !== 'PRESENT_PLAYER_PAID' &&
-            // FIX BUG 7 (display): hide BOTH_REFUNDED from active list too
-            (c as any).status !== 'BOTH_REFUNDED'
-        )
-      );
+  // Reconcile any of the player's challenges whose deadline has passed, even if
+  // no Play tab was open when it lapsed. This is the failsafe that guarantees
+  // locked stakes are always released — refund, forfeit, or settle as due.
+  const reconcileAndList = useCallback(() => {
+    if (!uid) return;
+    const mine = listChallenges(uid);
+    const t = Date.now();
+    for (const ch of mine) {
+      if (!ch.settled && !TERMINAL.has((ch as any).status)) {
+        try { checkAndAdjudicate(ch.code, t); } catch { /* best-effort */ }
+      }
     }
-  }, [uid]);
+    setActive(listChallenges(uid).filter(c => !TERMINAL.has((c as any).status)));
+    refresh();
+  }, [uid, refresh]);
+
+  useEffect(() => { reconcileAndList(); }, [reconcileAndList]);
+
+  // Live: refresh the list the instant any challenge changes in another tab.
+  useEffect(() => {
+    const unsub = subscribe('challenge', () => reconcileAndList());
+    return unsub;
+  }, [reconcileAndList]);
+
+  // Keep relative timers/labels fresh and keep sweeping while on this page.
+  useEffect(() => {
+    const id = setInterval(() => { setNow(Date.now()); reconcileAndList(); }, 2000);
+    return () => clearInterval(id);
+  }, [reconcileAndList]);
 
   const onJoin = () => {
     if (!code.trim()) return;
@@ -34,16 +88,7 @@ export default function ArcadePage() {
     try {
       const u = new URL(trimmed);
       const invite = u.searchParams.get('invite');
-
-      /*
-        FIX BUG 6: the invite URL format is /challenge/join/<CODE>?invite=<...>
-        The challenge code is in the PATHNAME (last segment), not in a query param
-        called "code". The old code did u.searchParams.get('code') which always
-        returned null, so hydrateChallengeFromInvite was never called from here
-        and cross-device joins via the Arcade join box were silently broken.
-      */
       const pathSegments = u.pathname.split('/').filter(Boolean);
-      // e.g. ['challenge', 'join', 'ABCD1234']
       const codeFromPath =
         pathSegments.length >= 3 && pathSegments[0] === 'challenge' && pathSegments[1] === 'join'
           ? pathSegments[2]
@@ -54,19 +99,21 @@ export default function ArcadePage() {
         window.location.href = `/challenge/join/${codeFromPath.toUpperCase()}?invite=${encodeURIComponent(invite)}`;
         return;
       }
-
       if (codeFromPath) {
         window.location.href = `/challenge/join/${codeFromPath.toUpperCase()}`;
         return;
       }
-
-      // URL that doesn't match expected shape — fall through to bare-code path
     } catch {
       // Not a URL — treat as bare code below
     }
 
-    // Bare code
     window.location.href = `/challenge/join/${trimmed.toUpperCase()}`;
+  };
+
+  const toneClass: Record<string, string> = {
+    urgent: 'text-green-300 border-green-500/40 bg-green-500/10',
+    wait: 'text-yellow-300/90 border-yellow-500/30 bg-yellow-500/5',
+    go: 'text-zinc-300 border-zinc-700 bg-zinc-900',
   };
 
   return (
@@ -77,17 +124,23 @@ export default function ArcadePage() {
         <section className="mb-8">
           <h2 className="text-sm uppercase text-zinc-400 mb-3">Your active challenges</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {active.map(ch => (
-              <Link
-                key={ch.code}
-                href={`/challenge/play/${ch.code}?role=${ch.creatorUid === uid ? 'creator' : 'opponent'}`}
-                className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 hover:bg-zinc-900"
-              >
-                <div className="text-xs text-zinc-500 mb-1">{ch.status}</div>
-                <div className="text-lg font-mono font-bold">{ch.code}</div>
-                <div className="text-sm text-zinc-400">{ch.gameType} · {ch.stake} coins</div>
-              </Link>
-            ))}
+            {active.map(ch => {
+              const a = action(ch, uid, now);
+              return (
+                <Link
+                  key={ch.code}
+                  href={`/challenge/play/${ch.code}?role=${ch.creatorUid === uid ? 'creator' : 'opponent'}`}
+                  className="rounded-xl border border-zinc-800 bg-zinc-950 p-4 hover:bg-zinc-900 relative"
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <div className="text-xs text-zinc-500">{ch.status}</div>
+                    <span className={`text-[11px] px-2 py-0.5 rounded-full border ${toneClass[a.tone]}`}>{a.label}</span>
+                  </div>
+                  <div className="text-lg font-mono font-bold">{ch.code}</div>
+                  <div className="text-sm text-zinc-400">{ch.gameType} · {ch.stake} coins</div>
+                </Link>
+              );
+            })}
           </div>
         </section>
       )}

@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useParams, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { useWallet } from '@/contexts/WalletContext';
@@ -16,57 +16,57 @@ import type { Challenge } from '@/types/challenge';
 import type { Connect4MatchState } from '@/types/connect4';
 import { readMatch } from '@/store/connect4.store';
 import { hydrateChallengeFromInvite } from '@/services/challenge.service';
+import { subscribe, matchesCode } from '@/lib/realtime';
 
 export default function PlayPage() {
   const { code } = useParams<{ code: string }>();
   const params = useSearchParams();
-  const role = (params.get('role') as 'creator' | 'opponent') || 'creator';
+  const urlRole = (params.get('role') as 'creator' | 'opponent') || 'creator';
   const { uid } = useAuth();
   const { refresh } = useWallet();
   const router = useRouter();
   const [ch, setCh] = useState<Challenge | null>(null);
   const [now, setNow] = useState(Date.now());
+  const [notice, setNotice] = useState<string | null>(null);
+  const prevStatus = useRef<string | null>(null);
 
-  // FIX BUG 1: carry the invite string through from create page so AwaitingOpponentView
-  // can render the share link without the creator coming back here.
   const inviteParam = params.get('invite') ?? undefined;
+
+  // Role is derived from identity, not the URL — robust against opening the wrong
+  // link. URL role is only a fallback for the first paint before the challenge loads.
+  const role: 'creator' | 'opponent' = useMemo(() => {
+    if (ch && uid) {
+      if (ch.creatorUid === uid) return 'creator';
+      if (ch.opponentUid === uid) return 'opponent';
+    }
+    return urlRole;
+  }, [ch, uid, urlRole]);
 
   const sync = () => {
     const latest = getChallenge(code);
     if (latest) setCh({ ...latest });
   };
 
+  // Mount: hydrate from invite (opponent landing fresh) and read current state.
+  // No silent auto-join here — entering a match is now an explicit action so it
+  // can never be skipped by a mount-timing race (the old creator-no-show bug).
   useEffect(() => {
-    // Hydrate from invite param if present (handles opponent landing directly on play page
-    // after auth redirect, which now points here instead of join page)
     if (inviteParam) hydrateChallengeFromInvite(inviteParam);
-
-    const latest = getChallenge(code);
-    if (!latest) return;
-
-    /*
-      FIX BUG 4: only call joinMatch when the challenge is actually in a joinable state.
-      Previously this fired even on AWAITING_OPPONENT, silently failed, and left
-      creatorJoined = false — causing the creator to be forfeited when the join window
-      timer expired.
-    */
-    if (
-      latest.status === 'FULLY_FUNDED' ||
-      latest.status === 'JOIN_WINDOW_STARTED' ||
-      latest.status === 'MATCH_ACTIVE'
-    ) {
-      try {
-        joinMatch({ code, uid });
-      } catch (e) {
-        // Log but don't swallow — useful for debugging join races
-        console.warn('[joinMatch]', e instanceof Error ? e.message : e);
-      }
-    }
-
     sync();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [code, uid]);
 
+  // Realtime: react the instant the counterparty changes state (same browser).
+  useEffect(() => {
+    const unsub = subscribe('challenge', (signal) => {
+      if (matchesCode(signal, code)) sync();
+    });
+    return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code]);
+
+  // Poll: drives deadlines + settlement while this tab is open, and keeps the
+  // clock fresh. Realtime handles propagation; this is the safety net.
   useEffect(() => {
     const id = setInterval(() => {
       checkAndAdjudicate(code, Date.now());
@@ -77,76 +77,125 @@ export default function PlayPage() {
     return () => clearInterval(id);
   }, [code, refresh]);
 
-  if (!ch) {
-    return (
-      <Shell showBack onBack={() => router.push('/arcade')}>
-        <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5 max-w-xl">
-          <h2 className="text-xl font-bold mb-2">Challenge Not Found</h2>
+  // Surface a one-time notice when the opponent accepts (creator's view flips).
+  useEffect(() => {
+    if (!ch) return;
+    const prev = prevStatus.current;
+    if (prev === 'AWAITING_OPPONENT' && ch.status !== 'AWAITING_OPPONENT') {
+      setNotice(
+        ch.gameType === 'CONNECT4'
+          ? 'Opponent accepted — both stakes locked. Enter the match to ready up.'
+          : 'Opponent accepted — both stakes locked. Play your run.'
+      );
+    }
+    prevStatus.current = ch.status;
+  }, [ch?.status, ch?.gameType]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onEnterMatch = () => {
+    try {
+      joinMatch({ code, uid });
+      sync();
+    } catch (e) {
+      console.warn('[enterMatch]', e instanceof Error ? e.message : e);
+    }
+  };
+
+  const banner =
+    notice ? (
+      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[92%]">
+        <div className="flex items-start gap-3 rounded-xl border border-green-500/40 bg-green-500/10 backdrop-blur px-4 py-3 text-sm text-green-200 shadow-lg">
+          <span className="flex-1">{notice}</span>
+          <button onClick={() => setNotice(null)} className="text-green-300/70 hover:text-green-200">✕</button>
         </div>
-      </Shell>
-    );
-  }
+      </div>
+    ) : null;
 
-  // Terminal states — show result
-  // FIX BUG 7 (display side): BOTH_REFUNDED is now a possible terminal status from
-  // settleNoShow — make sure ResultView handles it.
-  if (
-    ch.status === 'SETTLED' ||
-    ch.status === 'CREATOR_REFUNDED' ||
-    ch.status === 'PRESENT_PLAYER_PAID' ||
-    ch.status === 'FORFEIT' ||
-    (ch as any).status === 'BOTH_REFUNDED'
-  ) {
-    return <ResultView ch={ch} role={role} onBack={() => router.push('/arcade')} />;
-  }
+  const view = (() => {
+    if (!ch) {
+      return (
+        <Shell showBack onBack={() => router.push('/arcade')}>
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5 max-w-xl">
+            <h2 className="text-xl font-bold mb-2">Challenge Not Found</h2>
+          </div>
+        </Shell>
+      );
+    }
 
-  // Pre-match states
-  if (ch.status === 'AWAITING_OPPONENT') {
-    return (
-      <AwaitingOpponentView
-        ch={ch}
-        role={role}
-        now={now}
-        inviteParam={inviteParam}
-        onBack={() => router.push('/arcade')}
-      />
-    );
-  }
+    // Terminal states — show result
+    if (
+      ch.status === 'SETTLED' ||
+      ch.status === 'CREATOR_REFUNDED' ||
+      ch.status === 'PRESENT_PLAYER_PAID' ||
+      ch.status === 'FORFEIT' ||
+      (ch as any).status === 'BOTH_REFUNDED'
+    ) {
+      return <ResultView ch={ch} role={role} onBack={() => router.push('/arcade')} />;
+    }
 
-  if (ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') {
-    return <JoinWindowView ch={ch} role={role} now={now} onBack={() => router.push('/arcade')} />;
-  }
+    if (ch.status === 'AWAITING_OPPONENT') {
+      return (
+        <AwaitingOpponentView
+          ch={ch}
+          now={now}
+          inviteParam={inviteParam}
+          onBack={() => router.push('/arcade')}
+        />
+      );
+    }
 
-  // Active match
-  if (ch.status === 'MATCH_ACTIVE') {
-    if (ch.gameType === 'CONNECT4') return <Connect4Play ch={ch} role={role} now={now} onSync={sync} onBack={() => router.push('/arcade')} />;
-    return <AsyncPlay ch={ch} role={role} onSync={sync} onBack={() => router.push('/arcade')} />;
-  }
+    if (ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') {
+      return (
+        <JoinWindowView
+          ch={ch}
+          role={role}
+          now={now}
+          onEnter={onEnterMatch}
+          onBack={() => router.push('/arcade')}
+        />
+      );
+    }
 
-  return null;
+    if (ch.status === 'MATCH_ACTIVE') {
+      if (ch.gameType === 'CONNECT4') return <Connect4Play ch={ch} role={role} now={now} onSync={sync} onBack={() => router.push('/arcade')} />;
+      return <AsyncPlay ch={ch} role={role} onSync={sync} onBack={() => router.push('/arcade')} />;
+    }
+
+    return null;
+  })();
+
+  return (
+    <>
+      {banner}
+      {view}
+    </>
+  );
+}
+
+// ── Money state chip ──────────────────────────────────────────────────────────
+
+function StakeChip({ label, tone }: { label: string; tone: 'locked' | 'risk' | 'won' | 'safe' }) {
+  const tones: Record<string, string> = {
+    locked: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-300',
+    risk: 'border-red-500/30 bg-red-500/10 text-red-300',
+    won: 'border-green-500/30 bg-green-500/10 text-green-300',
+    safe: 'border-zinc-700 bg-zinc-900 text-zinc-300',
+  };
+  return <span className={`inline-block text-[11px] px-2 py-1 rounded-full border ${tones[tone]}`}>{label}</span>;
 }
 
 // ── Awaiting opponent ─────────────────────────────────────────────────────────
 
 function AwaitingOpponentView({
   ch,
-  role,
   now,
   inviteParam,
   onBack,
 }: {
   ch: Challenge;
-  role: string;
   now: number;
   inviteParam?: string;
   onBack: () => void;
 }) {
-  /*
-    FIX BUG 1: regenerate the invite + share URL here so the creator always has
-    something to copy, whether they navigated here directly from create or refreshed
-    the page. We prefer the param passed in (avoids re-encoding); fall back to
-    re-encoding the live challenge object.
-  */
   const invite = inviteParam ?? (typeof window !== 'undefined' ? encodeChallengeInvite(ch) : '');
   const shareUrl = (() => {
     if (typeof window === 'undefined' || !invite) return '';
@@ -156,21 +205,19 @@ function AwaitingOpponentView({
     return u.toString();
   })();
 
-  /*
-    FIX BUG 3: tell the creator explicitly to stay on this page — there is no
-    cross-device / cross-tab push in the current localStorage architecture.
-    The 1-second poll in PlayPage will auto-transition the view when the opponent
-    accepts, but only if this tab is open.
-  */
   return (
     <Shell showBack onBack={onBack}>
       <div className="max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
-        <h1 className="text-2xl font-bold mb-2">Waiting for opponent</h1>
+        <div className="flex items-center justify-between mb-2">
+          <h1 className="text-2xl font-bold">Waiting for opponent</h1>
+          <StakeChip label={`${ch.stake} locked`} tone="locked" />
+        </div>
         <p className="text-sm text-zinc-400 mb-1">
-          Your stake of {ch.stake} coins is locked. Share the invite link below.
+          Your stake of {ch.stake} coins is held in escrow. Share the invite link below.
         </p>
-        <p className="text-xs text-yellow-400 mb-4">
-          ⚠ Keep this tab open — this page will update automatically when your opponent accepts.
+        <p className="text-xs text-yellow-400/90 mb-4">
+          This page updates automatically the moment your opponent accepts — on the same
+          browser. (Cross-device push arrives with the Phase 2 backend.)
         </p>
 
         {shareUrl && (
@@ -179,18 +226,33 @@ function AwaitingOpponentView({
           </div>
         )}
 
-        <div className="flex gap-4 text-xs text-zinc-500">
+        <div className="flex flex-wrap gap-4 text-xs text-zinc-500">
           <span>Code: <span className="font-mono text-white">{ch.code}</span></span>
           <span>Expires in <span className="font-mono text-yellow-300">{formatSeconds(ch.expiresAt - now)}</span></span>
         </div>
+        <p className="text-[11px] text-zinc-600 mt-3">
+          If it expires with no opponent, your stake is refunded automatically.
+        </p>
       </div>
     </Shell>
   );
 }
 
-// ── Join window (3 min for both players to enter) ─────────────────────────────
+// ── Join window (Connect 4 only — explicit entry) ─────────────────────────────
 
-function JoinWindowView({ ch, role, now, onBack }: { ch: Challenge; role: string; now: number; onBack: () => void }) {
+function JoinWindowView({
+  ch,
+  role,
+  now,
+  onEnter,
+  onBack,
+}: {
+  ch: Challenge;
+  role: 'creator' | 'opponent';
+  now: number;
+  onEnter: () => void;
+  onBack: () => void;
+}) {
   const youJoined = role === 'creator' ? ch.creatorJoined : ch.opponentJoined;
   const otherJoined = role === 'creator' ? ch.opponentJoined : ch.creatorJoined;
   const remaining = ch.joinDeadlineAt ? ch.joinDeadlineAt - now : 0;
@@ -198,17 +260,28 @@ function JoinWindowView({ ch, role, now, onBack }: { ch: Challenge; role: string
   return (
     <Shell showBack onBack={onBack}>
       <div className="max-w-2xl rounded-2xl border border-yellow-500/30 bg-yellow-500/5 p-6">
-        <div className="text-xs uppercase text-yellow-400 mb-2">Both stakes locked</div>
-        <h1 className="text-2xl font-bold mb-2">Enter the arena</h1>
-        {/* FIX BUG 7 (display): no-show now refunds both — update the copy */}
-        <p className="text-sm text-zinc-300 mb-4">
-          Both players have <span className="font-mono text-white">{formatSeconds(remaining)}</span> to join.
-          If either player doesn&apos;t join in time, both stakes are refunded.
-        </p>
-        <div className="space-y-2 mb-4">
-          <div className="text-sm">You: {youJoined ? <span className="text-green-400">Joined</span> : <span className="text-yellow-300">Joining…</span>}</div>
-          <div className="text-sm">Opponent: {otherJoined ? <span className="text-green-400">Joined</span> : <span className="text-yellow-300">Waiting</span>}</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs uppercase text-yellow-400">Both stakes locked</div>
+          <StakeChip label={`${ch.stake} at risk`} tone="risk" />
         </div>
+        <h1 className="text-2xl font-bold mb-2">Enter the arena</h1>
+        <p className="text-sm text-zinc-300 mb-4">
+          Tap below within <span className="font-mono text-white">{formatSeconds(remaining)}</span> to enter.
+          If either player doesn&apos;t enter in time, both stakes are refunded in full.
+        </p>
+
+        <div className="space-y-2 mb-5">
+          <div className="text-sm">You: {youJoined ? <span className="text-green-400">In</span> : <span className="text-yellow-300">Not entered</span>}</div>
+          <div className="text-sm">Opponent: {otherJoined ? <span className="text-green-400">In</span> : <span className="text-zinc-400">Waiting…</span>}</div>
+        </div>
+
+        {!youJoined ? (
+          <button onClick={onEnter} className="w-full px-4 py-3 rounded-lg bg-white text-black font-semibold">
+            Enter Match
+          </button>
+        ) : (
+          <div className="text-sm text-zinc-400">You&apos;re in. Waiting for your opponent to enter — the match starts the moment they do.</div>
+        )}
       </div>
     </Shell>
   );
@@ -220,6 +293,7 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
   const { uid } = useAuth();
   const { refresh } = useWallet();
   const yourResult = role === 'creator' ? ch.creatorResult : ch.opponentResult;
+  const otherResult = role === 'creator' ? ch.opponentResult : ch.creatorResult;
   const [err, setErr] = useState<string | null>(null);
 
   const onDone = (moves: AsyncMoveRecord[]) => {
@@ -236,15 +310,20 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
     <Shell showBack onBack={onBack}>
       <div className="grid grid-cols-1 md:grid-cols-[1fr_320px] gap-6">
         <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
-          <div className="mb-4">
-            <div className="text-sm text-zinc-400">Challenge</div>
-            <div className="text-2xl font-mono font-bold">{ch.code}</div>
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <div className="text-sm text-zinc-400">Challenge</div>
+              <div className="text-2xl font-mono font-bold">{ch.code}</div>
+            </div>
+            <StakeChip label={`${ch.stake} at risk`} tone="risk" />
           </div>
           {yourResult ? (
             <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-4">
               <div className="text-sm text-zinc-400">Your time</div>
               <div className="text-2xl font-mono font-bold">{(yourResult.finalMs / 1000).toFixed(6)}s</div>
-              <div className="text-xs text-zinc-500 mt-2">Waiting for opponent…</div>
+              <div className="text-xs text-zinc-500 mt-2">
+                {otherResult ? 'Settling…' : 'Submitted — waiting for opponent to finish their run.'}
+              </div>
             </div>
           ) : (
             <>
@@ -259,6 +338,11 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
           <h3 className="text-lg font-bold mb-2">Match</h3>
           <div className="text-sm text-zinc-400">Stake each: {ch.stake} · Pot {ch.stake * 2}</div>
           <div className="text-xs text-zinc-500 mt-2">Game: {gameTitle(ch.gameType)}</div>
+          <ul className="text-sm text-zinc-400 space-y-1 mt-3">
+            <li>You: {yourResult ? <span className="text-green-400">Done</span> : <span className="text-yellow-300">Playing…</span>}</li>
+            <li>Opponent: {otherResult ? <span className="text-green-400">Done</span> : <span className="text-zinc-400">Playing…</span>}</li>
+          </ul>
+          <p className="text-[11px] text-zinc-600 mt-3">Both run the same board independently. Fastest valid time wins.</p>
         </aside>
       </div>
     </Shell>
@@ -366,12 +450,12 @@ function Connect4Play({ ch, role, now, onSync, onBack }: { ch: Challenge; role: 
   const [match, setMatch] = useState<Connect4MatchState | null>(() => readMatch(ch.code) ?? null);
   const [err, setErr] = useState<string | null>(null);
 
+  // React to board changes via realtime + a light poll fallback.
   useEffect(() => {
-    const id = setInterval(() => {
-      const m = readMatch(ch.code);
-      if (m) setMatch({ ...m });
-    }, 1000);
-    return () => clearInterval(id);
+    const pull = () => { const m = readMatch(ch.code); if (m) setMatch({ ...m }); };
+    const unsub = subscribe('match', (signal) => { if (matchesCode(signal, ch.code)) pull(); });
+    const id = setInterval(pull, 1000);
+    return () => { unsub(); clearInterval(id); };
   }, [ch.code]);
 
   if (!match) return null;
@@ -441,6 +525,7 @@ function Connect4Play({ ch, role, now, onSync, onBack }: { ch: Challenge; role: 
             <li>Opponent: {ch.readyOpponent ? <span className="text-green-400">Ready</span> : 'Waiting'}</li>
           </ul>
           <div className="mt-3 text-xs text-zinc-500">Pot: {ch.stake * 2}</div>
+          <div className="mt-2"><StakeChip label={`${ch.stake} at risk`} tone="risk" /></div>
         </aside>
       </div>
     </Shell>
@@ -476,17 +561,25 @@ function ResultView({ ch, role, onBack }: { ch: Challenge; role: string; onBack:
 
   const headline = (() => {
     if (ch.status === 'CREATOR_REFUNDED') return 'Stake reclaimed';
-    // FIX BUG 7 (display): no-show now yields BOTH_REFUNDED
     if ((ch as any).status === 'BOTH_REFUNDED') return 'No-show — both stakes refunded';
     if (ch.resultType === 'DRAW') return 'Draw — both refunded';
     if (ch.resultType === 'FORFEIT') return youWon ? 'You win by forfeit' : 'Opponent wins by forfeit';
     return youWon ? 'You win 🏆' : 'Opponent wins';
   })();
 
+  const tone: 'won' | 'safe' = youWon ? 'won' : 'safe';
+  const chip = (() => {
+    if (ch.status === 'CREATOR_REFUNDED' || (ch as any).status === 'BOTH_REFUNDED' || ch.resultType === 'DRAW') return 'Refunded';
+    return youWon ? `+${snap?.winnerAmount ?? 0}` : 'Stake lost';
+  })();
+
   return (
     <Shell showBack onBack={onBack}>
       <div className="max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
-        <h1 className="text-3xl font-bold mb-4">{headline}</h1>
+        <div className="flex items-center justify-between mb-4">
+          <h1 className="text-3xl font-bold">{headline}</h1>
+          <StakeChip label={chip} tone={chip === 'Stake lost' ? 'risk' : tone} />
+        </div>
         {snap && (
           <div className="space-y-2 text-sm text-zinc-300">
             <div>Pot: {snap.pot} coins</div>
@@ -498,6 +591,7 @@ function ResultView({ ch, role, onBack }: { ch: Challenge; role: string; onBack:
             <div className="text-xs text-zinc-500 mt-3 font-mono">TX: {ch.settlementTxId}</div>
           </div>
         )}
+        <button onClick={onBack} className="mt-5 px-4 py-2 rounded-lg bg-white text-black font-semibold">Back to Arcade</button>
       </div>
     </Shell>
   );

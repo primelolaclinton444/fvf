@@ -20,6 +20,8 @@ export type ChallengeStatus =
   | 'ONE_PLAYER_ABSENT'    // join window passed, one missing
   | 'FORFEIT'              // forfeit determined
   | 'PRESENT_PLAYER_PAID'; // forfeit payout complete
+  // types/challenge.ts — add to ChallengeStatus
+  | 'BOTH_REFUNDED'  // join window expired, both stakes returned
 
 export type FeeStructure = {
   developerFeePct: number;   // e.g. 5

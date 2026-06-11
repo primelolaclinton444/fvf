@@ -42,12 +42,26 @@ export default function JoinPage() {
 
   const onAccept = () => {
     setErr(null);
-    if (!authed) { router.push(`/auth?redirect=/challenge/join/${code}`); return; }
+
+    if (!authed) {
+      /*
+        FIX BUG 2: redirect after auth goes straight to the play page as opponent,
+        NOT back to the join page (which would show "already accepted" or loop).
+        We also preserve the invite param so hydration still works on the play page
+        if the opponent lands there on a fresh device.
+      */
+      const invite = params.get('invite');
+      const playUrl = `/challenge/play/${ch.code}?role=opponent${invite ? `&invite=${encodeURIComponent(invite)}` : ''}`;
+      router.push(`/auth?redirect=${encodeURIComponent(playUrl)}`);
+      return;
+    }
+
     if (ch.stake > balance) { setErr(`Insufficient balance — you have ${balance} coins. Top up first.`); return; }
+
     try {
-      const updated = acceptChallenge({ code: ch.code, uid });
-      setCh({ ...updated });
+      acceptChallenge({ code: ch.code, uid });
       refresh();
+      // FIX BUG 2: navigate using ch.code from the hydrated challenge, not from params
       router.push(`/challenge/play/${ch.code}?role=opponent`);
     } catch (e) {
       setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error');

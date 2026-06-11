@@ -1,4 +1,5 @@
 import type { Challenge } from '@/types/challenge';
+import { publish } from '@/lib/realtime';
 
 const LS_CHALLENGES = 'p4s_challenges_v3';
 
@@ -21,6 +22,8 @@ export function writeChallenge(ch: Challenge): void {
   const map = loadChallenges();
   map[ch.code] = ch;
   saveChallenges(map);
+  // Propagate to other tabs so the counterparty reacts without waiting for the poll.
+  publish('challenge', ch.code);
 }
 
 export function readAllChallenges(): Challenge[] {

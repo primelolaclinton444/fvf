@@ -4,8 +4,10 @@ import { useRouter, useParams, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { useWallet } from '@/contexts/WalletContext';
 import { Shell } from '@/components/ui/Shell';
+import { CopyableCode } from '@/components/ui/CopyableCode';
 import { useGameTimer } from '@/hooks/useGameTimer';
 import { getChallenge, joinMatch } from '@/services/challenge.service';
+import { encodeChallengeInvite } from '@/lib/invite';
 import { submitAsyncResult, submitConnect4Move, submitConnect4Ready, checkAndAdjudicate, type AsyncMoveRecord } from '@/services/game.service';
 import { gameGridFromSeed, prngFromSeed, seededPickUnique } from '@/lib/prng';
 import { gameTitle, formatSeconds } from '@/lib/format';
@@ -13,6 +15,7 @@ import { connect4Policy } from '@/config/connect4/policy';
 import type { Challenge } from '@/types/challenge';
 import type { Connect4MatchState } from '@/types/connect4';
 import { readMatch } from '@/store/connect4.store';
+import { hydrateChallengeFromInvite } from '@/services/challenge.service';
 
 export default function PlayPage() {
   const { code } = useParams<{ code: string }>();
@@ -24,20 +27,44 @@ export default function PlayPage() {
   const [ch, setCh] = useState<Challenge | null>(null);
   const [now, setNow] = useState(Date.now());
 
+  // FIX BUG 1: carry the invite string through from create page so AwaitingOpponentView
+  // can render the share link without the creator coming back here.
+  const inviteParam = params.get('invite') ?? undefined;
+
   const sync = () => {
     const latest = getChallenge(code);
     if (latest) setCh({ ...latest });
   };
 
   useEffect(() => {
+    // Hydrate from invite param if present (handles opponent landing directly on play page
+    // after auth redirect, which now points here instead of join page)
+    if (inviteParam) hydrateChallengeFromInvite(inviteParam);
+
     const latest = getChallenge(code);
-    if (latest) {
-      // Auto-join when entering the play page if not yet joined
-      if (latest.status === 'FULLY_FUNDED' || latest.status === 'JOIN_WINDOW_STARTED') {
-        try { joinMatch({ code, uid }); } catch {}
+    if (!latest) return;
+
+    /*
+      FIX BUG 4: only call joinMatch when the challenge is actually in a joinable state.
+      Previously this fired even on AWAITING_OPPONENT, silently failed, and left
+      creatorJoined = false — causing the creator to be forfeited when the join window
+      timer expired.
+    */
+    if (
+      latest.status === 'FULLY_FUNDED' ||
+      latest.status === 'JOIN_WINDOW_STARTED' ||
+      latest.status === 'MATCH_ACTIVE'
+    ) {
+      try {
+        joinMatch({ code, uid });
+      } catch (e) {
+        // Log but don't swallow — useful for debugging join races
+        console.warn('[joinMatch]', e instanceof Error ? e.message : e);
       }
-      sync();
     }
+
+    sync();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [code, uid]);
 
   useEffect(() => {
@@ -61,13 +88,29 @@ export default function PlayPage() {
   }
 
   // Terminal states — show result
-  if (ch.status === 'SETTLED' || ch.status === 'CREATOR_REFUNDED' || ch.status === 'PRESENT_PLAYER_PAID' || ch.status === 'FORFEIT') {
+  // FIX BUG 7 (display side): BOTH_REFUNDED is now a possible terminal status from
+  // settleNoShow — make sure ResultView handles it.
+  if (
+    ch.status === 'SETTLED' ||
+    ch.status === 'CREATOR_REFUNDED' ||
+    ch.status === 'PRESENT_PLAYER_PAID' ||
+    ch.status === 'FORFEIT' ||
+    (ch as any).status === 'BOTH_REFUNDED'
+  ) {
     return <ResultView ch={ch} role={role} onBack={() => router.push('/arcade')} />;
   }
 
   // Pre-match states
   if (ch.status === 'AWAITING_OPPONENT') {
-    return <AwaitingOpponentView ch={ch} role={role} now={now} onBack={() => router.push('/arcade')} />;
+    return (
+      <AwaitingOpponentView
+        ch={ch}
+        role={role}
+        now={now}
+        inviteParam={inviteParam}
+        onBack={() => router.push('/arcade')}
+      />
+    );
   }
 
   if (ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') {
@@ -83,22 +126,69 @@ export default function PlayPage() {
   return null;
 }
 
-// ── Awaiting opponent ────────────────────────────────────────────────────────
+// ── Awaiting opponent ─────────────────────────────────────────────────────────
 
-function AwaitingOpponentView({ ch, role, now, onBack }: { ch: Challenge; role: string; now: number; onBack: () => void }) {
+function AwaitingOpponentView({
+  ch,
+  role,
+  now,
+  inviteParam,
+  onBack,
+}: {
+  ch: Challenge;
+  role: string;
+  now: number;
+  inviteParam?: string;
+  onBack: () => void;
+}) {
+  /*
+    FIX BUG 1: regenerate the invite + share URL here so the creator always has
+    something to copy, whether they navigated here directly from create or refreshed
+    the page. We prefer the param passed in (avoids re-encoding); fall back to
+    re-encoding the live challenge object.
+  */
+  const invite = inviteParam ?? (typeof window !== 'undefined' ? encodeChallengeInvite(ch) : '');
+  const shareUrl = (() => {
+    if (typeof window === 'undefined' || !invite) return '';
+    const u = new URL(window.location.href);
+    u.pathname = `/challenge/join/${ch.code}`;
+    u.search = `?invite=${encodeURIComponent(invite)}`;
+    return u.toString();
+  })();
+
+  /*
+    FIX BUG 3: tell the creator explicitly to stay on this page — there is no
+    cross-device / cross-tab push in the current localStorage architecture.
+    The 1-second poll in PlayPage will auto-transition the view when the opponent
+    accepts, but only if this tab is open.
+  */
   return (
     <Shell showBack onBack={onBack}>
       <div className="max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
         <h1 className="text-2xl font-bold mb-2">Waiting for opponent</h1>
-        <p className="text-sm text-zinc-400 mb-4">Your stake of {ch.stake} coins is locked. Share the invite link below.</p>
-        <div className="text-xs text-zinc-500">Code: <span className="font-mono text-white">{ch.code}</span></div>
-        <div className="text-xs text-zinc-500 mt-1">Expires in {formatSeconds(ch.expiresAt - now)}</div>
+        <p className="text-sm text-zinc-400 mb-1">
+          Your stake of {ch.stake} coins is locked. Share the invite link below.
+        </p>
+        <p className="text-xs text-yellow-400 mb-4">
+          ⚠ Keep this tab open — this page will update automatically when your opponent accepts.
+        </p>
+
+        {shareUrl && (
+          <div className="mb-4">
+            <CopyableCode label="Invite link" value={shareUrl} />
+          </div>
+        )}
+
+        <div className="flex gap-4 text-xs text-zinc-500">
+          <span>Code: <span className="font-mono text-white">{ch.code}</span></span>
+          <span>Expires in <span className="font-mono text-yellow-300">{formatSeconds(ch.expiresAt - now)}</span></span>
+        </div>
       </div>
     </Shell>
   );
 }
 
-// ── Join window (3 min for both players to enter) ────────────────────────────
+// ── Join window (3 min for both players to enter) ─────────────────────────────
 
 function JoinWindowView({ ch, role, now, onBack }: { ch: Challenge; role: string; now: number; onBack: () => void }) {
   const youJoined = role === 'creator' ? ch.creatorJoined : ch.opponentJoined;
@@ -110,7 +200,11 @@ function JoinWindowView({ ch, role, now, onBack }: { ch: Challenge; role: string
       <div className="max-w-2xl rounded-2xl border border-yellow-500/30 bg-yellow-500/5 p-6">
         <div className="text-xs uppercase text-yellow-400 mb-2">Both stakes locked</div>
         <h1 className="text-2xl font-bold mb-2">Enter the arena</h1>
-        <p className="text-sm text-zinc-300 mb-4">Both players have {formatSeconds(remaining)} to join. No-show forfeits the pot.</p>
+        {/* FIX BUG 7 (display): no-show now refunds both — update the copy */}
+        <p className="text-sm text-zinc-300 mb-4">
+          Both players have <span className="font-mono text-white">{formatSeconds(remaining)}</span> to join.
+          If either player doesn&apos;t join in time, both stakes are refunded.
+        </p>
         <div className="space-y-2 mb-4">
           <div className="text-sm">You: {youJoined ? <span className="text-green-400">Joined</span> : <span className="text-yellow-300">Joining…</span>}</div>
           <div className="text-sm">Opponent: {otherJoined ? <span className="text-green-400">Joined</span> : <span className="text-yellow-300">Waiting</span>}</div>
@@ -120,7 +214,7 @@ function JoinWindowView({ ch, role, now, onBack }: { ch: Challenge; role: string
   );
 }
 
-// ── Async play (Scout / Down / Up) ───────────────────────────────────────────
+// ── Async play (Scout / Down / Up) ────────────────────────────────────────────
 
 function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator' | 'opponent'; onSync: () => void; onBack: () => void }) {
   const { uid } = useAuth();
@@ -265,7 +359,7 @@ function SeededUp({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRec
   );
 }
 
-// ── Connect 4 play ───────────────────────────────────────────────────────────
+// ── Connect 4 play ────────────────────────────────────────────────────────────
 
 function Connect4Play({ ch, role, now, onSync, onBack }: { ch: Challenge; role: 'creator' | 'opponent'; now: number; onSync: () => void; onBack: () => void }) {
   const { uid } = useAuth();
@@ -373,7 +467,7 @@ function Connect4Board({ board, disabled, onMove }: { board: number[]; disabled:
   );
 }
 
-// ── Result ──────────────────────────────────────────────────────────────────
+// ── Result ────────────────────────────────────────────────────────────────────
 
 function ResultView({ ch, role, onBack }: { ch: Challenge; role: string; onBack: () => void }) {
   const yourUid = role === 'creator' ? ch.creatorUid : ch.opponentUid;
@@ -382,6 +476,8 @@ function ResultView({ ch, role, onBack }: { ch: Challenge; role: string; onBack:
 
   const headline = (() => {
     if (ch.status === 'CREATOR_REFUNDED') return 'Stake reclaimed';
+    // FIX BUG 7 (display): no-show now yields BOTH_REFUNDED
+    if ((ch as any).status === 'BOTH_REFUNDED') return 'No-show — both stakes refunded';
     if (ch.resultType === 'DRAW') return 'Draw — both refunded';
     if (ch.resultType === 'FORFEIT') return youWon ? 'You win by forfeit' : 'Opponent wins by forfeit';
     return youWon ? 'You win 🏆' : 'Opponent wins';

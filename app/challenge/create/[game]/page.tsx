@@ -18,6 +18,7 @@ export default function CreatePage() {
   const router = useRouter();
   const [stake, setStake] = useState(50);
   const [err, setErr] = useState<string | null>(null);
+  // FIX BUG 1: store the invite string in state so it survives navigation to play page
   const [created, setCreated] = useState<{ code: string; invite: string } | null>(null);
 
   const onCreate = () => {
@@ -62,7 +63,16 @@ export default function CreatePage() {
           <p className="text-sm text-zinc-300 mb-4">Send this link to your opponent. They'll see your stake is already locked.</p>
           <CopyableCode label="Invite link" value={shareUrl(created.code, created.invite)} />
           <div className="flex gap-2 mt-4">
-            <button onClick={() => router.push(`/challenge/play/${created.code}?role=creator`)} className="px-4 py-2 rounded-lg bg-white text-black font-semibold">Enter Game Room</button>
+            {/*
+              FIX BUG 1: pass invite as a query param so PlayPage / AwaitingOpponentView
+              can regenerate the share link without the creator having to come back here.
+            */}
+            <button
+              onClick={() => router.push(`/challenge/play/${created.code}?role=creator&invite=${encodeURIComponent(created.invite)}`)}
+              className="px-4 py-2 rounded-lg bg-white text-black font-semibold"
+            >
+              Enter Game Room
+            </button>
             <button onClick={() => router.push('/arcade')} className="px-4 py-2 rounded-lg border border-zinc-800">Back to Arcade</button>
           </div>
         </div>

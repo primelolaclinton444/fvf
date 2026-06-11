@@ -4,10 +4,10 @@ import { readChallenge, writeChallenge } from '@/store/challenge.store';
 import { readMatch, writeMatch } from '@/store/connect4.store';
 import { prngFromSeed, seededPickUnique } from '@/lib/prng';
 import { applyMove, detectWinner, isDraw, type Connect4Board, type Connect4Player } from '@/lib/connect4/engine';
-import { settleAsync, settleConnect4, settleExpiredRefund, settleForfeit } from './settlement.service';
+import { settleAsync, settleConnect4, settleExpiredRefund, settleForfeit, settleNoShow } from './settlement.service';
 import { connect4Policy } from '@/config/connect4/policy';
 
-// ─── Async result validation (tamper-resistant) ─────────────────────────────
+// ─── Async result validation (tamper-resistant) ──────────────────────────────
 
 export type AsyncMoveRecord = {
   value: number;
@@ -71,7 +71,7 @@ function validateMoveSequence(ch: Challenge, moves: AsyncMoveRecord[]): void {
   }
 }
 
-// ─── Connect 4 ───────────────────────────────────────────────────────────────
+// ─── Connect 4 ────────────────────────────────────────────────────────────────
 
 export function submitConnect4Move(input: {
   code: string;
@@ -125,6 +125,14 @@ export function submitConnect4Ready(input: { code: string; uid: string; ready: b
   if (!ch || !match) throw new Error('CHALLENGE_NOT_FOUND');
   if (!ch.creatorAccepted || !ch.opponentAccepted) throw new Error('STAKES_NOT_LOCKED');
 
+  /*
+    FIX BUG 5: guard against ready calls before both players have joined.
+    Without this, both players can toggle ready while status is still FULLY_FUNDED,
+    which transitions phase to IN_PROGRESS before status reaches MATCH_ACTIVE.
+    submitConnect4Move then throws MATCH_NOT_ACTIVE on every move, deadlocking the game.
+  */
+  if (ch.status !== 'MATCH_ACTIVE') throw new Error('MATCH_NOT_ACTIVE');
+
   if (uid === ch.creatorUid) ch.readyCreator = ready;
   else if (uid === ch.opponentUid) ch.readyOpponent = ready;
   else throw new Error('NOT_A_PARTICIPANT');
@@ -147,13 +155,13 @@ export function submitConnect4Ready(input: { code: string; uid: string; ready: b
 }
 
 /**
- * Check deadlines and adjudicate. Called on every poll cycle.
+ * Check deadlines and adjudicate. Called on every poll cycle from PlayPage.
  */
 export function checkAndAdjudicate(code: string, now: number): void {
   const ch = readChallenge(code);
   if (!ch || ch.settled) return;
 
-  // Challenge expired with no opponent
+  // Challenge expired with no opponent — refund creator
   if (ch.status === 'AWAITING_OPPONENT' && now > ch.expiresAt) {
     ch.status = 'EXPIRED';
     writeChallenge(ch);
@@ -162,18 +170,29 @@ export function checkAndAdjudicate(code: string, now: number): void {
   }
 
   // Join window expired
-  if ((ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') && ch.joinDeadlineAt && now > ch.joinDeadlineAt) {
+  if (
+    (ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') &&
+    ch.joinDeadlineAt &&
+    now > ch.joinDeadlineAt
+  ) {
     const bothJoined = ch.creatorJoined && ch.opponentJoined;
     if (!bothJoined) {
-      const absent = !ch.creatorJoined ? ch.creatorUid : ch.opponentUid;
+      /*
+        FIX BUG 7: connect4Policy.noShowPolicy === 'REFUND_BOTH'.
+        Previously the code ignored this setting and always called settleForfeit,
+        which punished the absent player. Now we honour the policy: if either or
+        both players didn't show up in time, both stakes are returned in full.
+        Turn timeout mid-game still calls settleForfeit — that is intentional and
+        separate from the join-window no-show scenario.
+      */
       ch.status = 'ONE_PLAYER_ABSENT';
       writeChallenge(ch);
-      if (absent) settleForfeit(ch, absent);
+      settleNoShow(ch);
       return;
     }
   }
 
-  // Connect 4 turn timeout
+  // Connect 4 turn timeout — the player who let their clock run out forfeits
   if (ch.gameType === 'CONNECT4' && ch.phase === 'IN_PROGRESS' && ch.turnDeadlineAt && now > ch.turnDeadlineAt) {
     const forfeitUid = ch.currentTurnUid ?? '';
     if (forfeitUid) {

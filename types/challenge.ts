@@ -19,9 +19,8 @@ export type ChallengeStatus =
   | 'CREATOR_REFUNDED'     // post-expiry refund done
   | 'ONE_PLAYER_ABSENT'    // join window passed, one missing
   | 'FORFEIT'              // forfeit determined
-  | 'PRESENT_PLAYER_PAID'; // forfeit payout complete
-  // types/challenge.ts — add to ChallengeStatus
-  | 'BOTH_REFUNDED'  // join window expired, both stakes returned
+  | 'PRESENT_PLAYER_PAID'  // forfeit payout complete
+  | 'BOTH_REFUNDED';       // join window expired, both stakes returned
 
 export type FeeStructure = {
   developerFeePct: number;   // e.g. 5
@@ -41,7 +40,7 @@ export type SettlementSnapshot = {
   developerAmount: number;
   protocolAmount: number;
   winnerUid: string | null;
-  reason: ChallengeResultType | 'TIE' | 'REFUND';
+  reason: ChallengeResultType | 'TIE' | 'REFUND' | 'NO_SHOW_REFUND';
   finalizedAt: number;
 };
 

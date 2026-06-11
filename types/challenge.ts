@@ -69,6 +69,7 @@ export type Challenge = {
   expiresAt: number;
   joinWindowStartedAt?: number;
   joinDeadlineAt?: number;
+  matchDeadlineAt?: number;       // async: deadline for both runs to be submitted
   creatorJoined?: boolean;
   opponentJoined?: boolean;
 

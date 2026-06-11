@@ -6,7 +6,7 @@ import { genCode } from '@/lib/prng';
 import { createEmptyBoard } from '@/lib/connect4/engine';
 import { decodeChallengeInvite } from '@/lib/invite';
 import { connect4Policy } from '@/config/connect4/policy';
-import { CHALLENGE_EXPIRY_MS, JOIN_WINDOW_MS } from '@/config/challenge';
+import { CHALLENGE_EXPIRY_MS, JOIN_WINDOW_MS, ASYNC_MATCH_DEADLINE_MS } from '@/config/challenge';
 import { defaultFeeStructure } from '@/config/fees';
 
 /**
@@ -91,13 +91,13 @@ export function acceptChallenge(input: {
   ch.opponentUid = uid;
   ch.opponentAccepted = true;
   ch.escrowedOpponent = ch.stake;
-  ch.status = 'FULLY_FUNDED';
-
-  // Start join window
-  ch.joinWindowStartedAt = now;
-  ch.joinDeadlineAt = now + JOIN_WINDOW_MS;
 
   if (ch.gameType === 'CONNECT4') {
+    // SYNC: presence matters. Both players must enter within the join window,
+    // then ready up. Status holds at FULLY_FUNDED until both have entered.
+    ch.status = 'FULLY_FUNDED';
+    ch.joinWindowStartedAt = now;
+    ch.joinDeadlineAt = now + JOIN_WINDOW_MS;
     ch.mode = 'SYNC';
     ch.phase = 'WAITING_READY';
     ch.readyDeadlineAt = now + connect4Policy.readyTimeoutMs;
@@ -114,6 +114,15 @@ export function acceptChallenge(input: {
         phase: 'WAITING_READY',
       }
     );
+  } else {
+    // ASYNC (Scout/Down/Up): each player runs their own seeded board, so there is
+    // nothing to synchronise. Open the match immediately — no join window, no
+    // no-show dead-end. A match deadline guarantees stakes can't strand if one
+    // player never plays (see checkAndAdjudicate).
+    ch.status = 'MATCH_ACTIVE';
+    ch.creatorJoined = true;
+    ch.opponentJoined = true;
+    ch.matchDeadlineAt = now + ASYNC_MATCH_DEADLINE_MS;
   }
 
   writeChallenge(ch);

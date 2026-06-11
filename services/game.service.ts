@@ -192,6 +192,32 @@ export function checkAndAdjudicate(code: string, now: number): void {
     }
   }
 
+  // Async match deadline — both players had the window to complete their run.
+  // One played → they win by forfeit (no-show forfeits). Neither → refund both.
+  if (
+    ch.status === 'MATCH_ACTIVE' &&
+    ch.gameType !== 'CONNECT4' &&
+    ch.matchDeadlineAt &&
+    now > ch.matchDeadlineAt
+  ) {
+    const creatorDone = Boolean(ch.creatorResult);
+    const opponentDone = Boolean(ch.opponentResult);
+
+    if (creatorDone && opponentDone) {
+      if (!ch.settled) settleAsync(ch); // both finished near the buzzer
+    } else if (creatorDone && !opponentDone && ch.opponentUid) {
+      settleForfeit(ch, ch.opponentUid); // opponent no-showed their run
+    } else if (opponentDone && !creatorDone && ch.creatorUid) {
+      settleForfeit(ch, ch.creatorUid); // creator no-showed their run
+    } else {
+      // Neither played — full refund to both, no fees.
+      ch.status = 'ONE_PLAYER_ABSENT';
+      writeChallenge(ch);
+      settleNoShow(ch);
+    }
+    return;
+  }
+
   // Connect 4 turn timeout — the player who let their clock run out forfeits
   if (ch.gameType === 'CONNECT4' && ch.phase === 'IN_PROGRESS' && ch.turnDeadlineAt && now > ch.turnDeadlineAt) {
     const forfeitUid = ch.currentTurnUid ?? '';

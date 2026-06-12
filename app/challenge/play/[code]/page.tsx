@@ -6,17 +6,15 @@ import { useWallet } from '@/contexts/WalletContext';
 import { Shell } from '@/components/ui/Shell';
 import { CopyableCode } from '@/components/ui/CopyableCode';
 import { useGameTimer } from '@/hooks/useGameTimer';
-import { getChallenge, joinMatch } from '@/services/challenge.service';
+import { getChallenge, joinMatch, requestAdjudication } from '@/services/challenge.service';
 import { encodeChallengeInvite } from '@/lib/invite';
-import { submitAsyncResult, submitConnect4Move, submitConnect4Ready, checkAndAdjudicate, type AsyncMoveRecord } from '@/services/game.service';
+import { submitAsyncResult, submitConnect4Move, submitConnect4Ready, type AsyncMoveRecord } from '@/services/game.service';
 import { gameGridFromSeed, prngFromSeed, seededPickUnique } from '@/lib/prng';
 import { gameTitle, formatSeconds } from '@/lib/format';
-import { connect4Policy } from '@/config/connect4/policy';
 import type { Challenge } from '@/types/challenge';
 import type { Connect4MatchState } from '@/types/connect4';
-import { readMatch } from '@/store/connect4.store';
-import { hydrateChallengeFromInvite } from '@/services/challenge.service';
-import { subscribe, matchesCode } from '@/lib/realtime';
+import { readMatchAsync } from '@/store/connect4.store';
+import { subscribeToChallenge } from '@/lib/realtime';
 
 export default function PlayPage() {
   const { code } = useParams<{ code: string }>();
@@ -30,10 +28,7 @@ export default function PlayPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const prevStatus = useRef<string | null>(null);
 
-  const inviteParam = params.get('invite') ?? undefined;
-
-  // Role is derived from identity, not the URL — robust against opening the wrong
-  // link. URL role is only a fallback for the first paint before the challenge loads.
+  // Role from identity — URL is fallback only.
   const role: 'creator' | 'opponent' = useMemo(() => {
     if (ch && uid) {
       if (ch.creatorUid === uid) return 'creator';
@@ -42,42 +37,41 @@ export default function PlayPage() {
     return urlRole;
   }, [ch, uid, urlRole]);
 
-  const sync = () => {
-    const latest = getChallenge(code);
-    if (latest) setCh({ ...latest });
+  const sync = async () => {
+    const latest = await getChallenge(code);
+    if (latest) setCh(latest);
   };
 
-  // Mount: hydrate from invite (opponent landing fresh) and read current state.
-  // No silent auto-join here — entering a match is now an explicit action so it
-  // can never be skipped by a mount-timing race (the old creator-no-show bug).
-  useEffect(() => {
-    if (inviteParam) hydrateChallengeFromInvite(inviteParam);
-    sync();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, uid]);
+  useEffect(() => { void sync(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [code, uid]);
 
-  // Realtime: react the instant the counterparty changes state (same browser).
+  // Realtime: re-fetch on any change to this challenge or its connect4 match.
   useEffect(() => {
-    const unsub = subscribe('challenge', (signal) => {
-      if (matchesCode(signal, code)) sync();
-    });
+    const unsub = subscribeToChallenge(code, () => { void sync(); });
     return unsub;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [code]);
 
-  // Poll: drives deadlines + settlement while this tab is open, and keeps the
-  // clock fresh. Realtime handles propagation; this is the safety net.
+  // Light tick for countdown labels + opportunistic adjudicate when a deadline
+  // crosses (cron still runs every 15s; this just makes "your" tab snappier).
   useEffect(() => {
     const id = setInterval(() => {
-      checkAndAdjudicate(code, Date.now());
-      sync();
       setNow(Date.now());
-      refresh();
+      void refresh();
     }, 1000);
     return () => clearInterval(id);
-  }, [code, refresh]);
+  }, [refresh]);
 
-  // Surface a one-time notice when the opponent accepts (creator's view flips).
+  // Hint the server to adjudicate as deadlines pass — server is idempotent, so
+  // safe to spam lightly. This is purely a latency optimisation for active tabs.
+  useEffect(() => {
+    if (!ch || ch.settled) return;
+    const checks = [ch.expiresAt, ch.joinDeadlineAt, ch.matchDeadlineAt, ch.turnDeadlineAt].filter(Boolean) as number[];
+    if (checks.some(t => Math.abs(t - now) < 1500)) {
+      void requestAdjudication(ch.code);
+    }
+  }, [ch, now]);
+
+  // Acceptance banner — fires when the creator's tab transitions out of AWAITING_OPPONENT.
   useEffect(() => {
     if (!ch) return;
     const prev = prevStatus.current;
@@ -85,30 +79,25 @@ export default function PlayPage() {
       setNotice(
         ch.gameType === 'CONNECT4'
           ? 'Opponent accepted — both stakes locked. Enter the match to ready up.'
-          : 'Opponent accepted — both stakes locked. Play your run.'
+          : 'Opponent accepted — both stakes locked. Play your run.',
       );
     }
     prevStatus.current = ch.status;
   }, [ch?.status, ch?.gameType]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const onEnterMatch = () => {
-    try {
-      joinMatch({ code, uid });
-      sync();
-    } catch (e) {
-      console.warn('[enterMatch]', e instanceof Error ? e.message : e);
-    }
+  const onEnterMatch = async () => {
+    try { await joinMatch({ code, uid }); await sync(); }
+    catch (e) { console.warn('[enterMatch]', e instanceof Error ? e.message : e); }
   };
 
-  const banner =
-    notice ? (
-      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[92%]">
-        <div className="flex items-start gap-3 rounded-xl border border-green-500/40 bg-green-500/10 backdrop-blur px-4 py-3 text-sm text-green-200 shadow-lg">
-          <span className="flex-1">{notice}</span>
-          <button onClick={() => setNotice(null)} className="text-green-300/70 hover:text-green-200">✕</button>
-        </div>
+  const banner = notice ? (
+    <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 max-w-md w-[92%]">
+      <div className="flex items-start gap-3 rounded-xl border border-green-500/40 bg-green-500/10 backdrop-blur px-4 py-3 text-sm text-green-200 shadow-lg">
+        <span className="flex-1">{notice}</span>
+        <button onClick={() => setNotice(null)} className="text-green-300/70 hover:text-green-200">✕</button>
       </div>
-    ) : null;
+    </div>
+  ) : null;
 
   const view = (() => {
     if (!ch) {
@@ -121,54 +110,28 @@ export default function PlayPage() {
       );
     }
 
-    // Terminal states — show result
-    if (
-      ch.status === 'SETTLED' ||
-      ch.status === 'CREATOR_REFUNDED' ||
-      ch.status === 'PRESENT_PLAYER_PAID' ||
-      ch.status === 'FORFEIT' ||
-      (ch as any).status === 'BOTH_REFUNDED'
-    ) {
+    if (ch.status === 'SETTLED' || ch.status === 'CREATOR_REFUNDED' || ch.status === 'PRESENT_PLAYER_PAID' ||
+        ch.status === 'FORFEIT' || (ch as any).status === 'BOTH_REFUNDED') {
       return <ResultView ch={ch} role={role} onBack={() => router.push('/arcade')} />;
     }
 
     if (ch.status === 'AWAITING_OPPONENT') {
-      return (
-        <AwaitingOpponentView
-          ch={ch}
-          now={now}
-          inviteParam={inviteParam}
-          onBack={() => router.push('/arcade')}
-        />
-      );
+      return <AwaitingOpponentView ch={ch} now={now} onBack={() => router.push('/arcade')} />;
     }
 
     if (ch.status === 'FULLY_FUNDED' || ch.status === 'JOIN_WINDOW_STARTED') {
-      return (
-        <JoinWindowView
-          ch={ch}
-          role={role}
-          now={now}
-          onEnter={onEnterMatch}
-          onBack={() => router.push('/arcade')}
-        />
-      );
+      return <JoinWindowView ch={ch} role={role} now={now} onEnter={onEnterMatch} onBack={() => router.push('/arcade')} />;
     }
 
     if (ch.status === 'MATCH_ACTIVE') {
-      if (ch.gameType === 'CONNECT4') return <Connect4Play ch={ch} role={role} now={now} onSync={sync} onBack={() => router.push('/arcade')} />;
+      if (ch.gameType === 'CONNECT4') return <Connect4Play ch={ch} now={now} onSync={sync} onBack={() => router.push('/arcade')} />;
       return <AsyncPlay ch={ch} role={role} onSync={sync} onBack={() => router.push('/arcade')} />;
     }
 
     return null;
   })();
 
-  return (
-    <>
-      {banner}
-      {view}
-    </>
-  );
+  return <>{banner}{view}</>;
 }
 
 // ── Money state chip ──────────────────────────────────────────────────────────
@@ -176,32 +139,22 @@ export default function PlayPage() {
 function StakeChip({ label, tone }: { label: string; tone: 'locked' | 'risk' | 'won' | 'safe' }) {
   const tones: Record<string, string> = {
     locked: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-300',
-    risk: 'border-red-500/30 bg-red-500/10 text-red-300',
-    won: 'border-green-500/30 bg-green-500/10 text-green-300',
-    safe: 'border-zinc-700 bg-zinc-900 text-zinc-300',
+    risk:   'border-red-500/30    bg-red-500/10    text-red-300',
+    won:    'border-green-500/30  bg-green-500/10  text-green-300',
+    safe:   'border-zinc-700      bg-zinc-900      text-zinc-300',
   };
   return <span className={`inline-block text-[11px] px-2 py-1 rounded-full border ${tones[tone]}`}>{label}</span>;
 }
 
 // ── Awaiting opponent ─────────────────────────────────────────────────────────
 
-function AwaitingOpponentView({
-  ch,
-  now,
-  inviteParam,
-  onBack,
-}: {
-  ch: Challenge;
-  now: number;
-  inviteParam?: string;
-  onBack: () => void;
-}) {
-  const invite = inviteParam ?? (typeof window !== 'undefined' ? encodeChallengeInvite(ch) : '');
+function AwaitingOpponentView({ ch, now, onBack }: { ch: Challenge; now: number; onBack: () => void }) {
+  const invite = typeof window !== 'undefined' ? encodeChallengeInvite(ch) : '';
   const shareUrl = (() => {
-    if (typeof window === 'undefined' || !invite) return '';
+    if (typeof window === 'undefined') return '';
     const u = new URL(window.location.href);
     u.pathname = `/challenge/join/${ch.code}`;
-    u.search = `?invite=${encodeURIComponent(invite)}`;
+    u.search = invite ? `?invite=${encodeURIComponent(invite)}` : '';
     return u.toString();
   })();
 
@@ -212,12 +165,8 @@ function AwaitingOpponentView({
           <h1 className="text-2xl font-bold">Waiting for opponent</h1>
           <StakeChip label={`${ch.stake} locked`} tone="locked" />
         </div>
-        <p className="text-sm text-zinc-400 mb-1">
-          Your stake of {ch.stake} coins is held in escrow. Share the invite link below.
-        </p>
-        <p className="text-xs text-yellow-400/90 mb-4">
-          This page updates automatically the moment your opponent accepts — on the same
-          browser. (Cross-device push arrives with the Phase 2 backend.)
+        <p className="text-sm text-zinc-400 mb-4">
+          Your stake of {ch.stake} coins is held in escrow. Share the invite link below — this page updates the instant they accept.
         </p>
 
         {shareUrl && (
@@ -230,28 +179,18 @@ function AwaitingOpponentView({
           <span>Code: <span className="font-mono text-white">{ch.code}</span></span>
           <span>Expires in <span className="font-mono text-yellow-300">{formatSeconds(ch.expiresAt - now)}</span></span>
         </div>
-        <p className="text-[11px] text-zinc-600 mt-3">
-          If it expires with no opponent, your stake is refunded automatically.
-        </p>
+        <p className="text-[11px] text-zinc-600 mt-3">If it expires with no opponent, your stake is refunded automatically.</p>
       </div>
     </Shell>
   );
 }
 
-// ── Join window (Connect 4 only — explicit entry) ─────────────────────────────
+// ── Connect 4 join window ─────────────────────────────────────────────────────
 
 function JoinWindowView({
-  ch,
-  role,
-  now,
-  onEnter,
-  onBack,
+  ch, role, now, onEnter, onBack,
 }: {
-  ch: Challenge;
-  role: 'creator' | 'opponent';
-  now: number;
-  onEnter: () => void;
-  onBack: () => void;
+  ch: Challenge; role: 'creator' | 'opponent'; now: number; onEnter: () => void; onBack: () => void;
 }) {
   const youJoined = role === 'creator' ? ch.creatorJoined : ch.opponentJoined;
   const otherJoined = role === 'creator' ? ch.opponentJoined : ch.creatorJoined;
@@ -276,9 +215,7 @@ function JoinWindowView({
         </div>
 
         {!youJoined ? (
-          <button onClick={onEnter} className="w-full px-4 py-3 rounded-lg bg-white text-black font-semibold">
-            Enter Match
-          </button>
+          <button onClick={onEnter} className="w-full px-4 py-3 rounded-lg bg-white text-black font-semibold">Enter Match</button>
         ) : (
           <div className="text-sm text-zinc-400">You&apos;re in. Waiting for your opponent to enter — the match starts the moment they do.</div>
         )}
@@ -287,22 +224,26 @@ function JoinWindowView({
   );
 }
 
-// ── Async play (Scout / Down / Up) ────────────────────────────────────────────
+// ── Async play ────────────────────────────────────────────────────────────────
 
-function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator' | 'opponent'; onSync: () => void; onBack: () => void }) {
+function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator' | 'opponent'; onSync: () => Promise<void>; onBack: () => void }) {
   const { uid } = useAuth();
   const { refresh } = useWallet();
-  const yourResult = role === 'creator' ? ch.creatorResult : ch.opponentResult;
+  const yourResult  = role === 'creator' ? ch.creatorResult  : ch.opponentResult;
   const otherResult = role === 'creator' ? ch.opponentResult : ch.creatorResult;
   const [err, setErr] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
-  const onDone = (moves: AsyncMoveRecord[]) => {
+  const onDone = async (moves: AsyncMoveRecord[]) => {
+    setErr(null); setSubmitting(true);
     try {
-      submitAsyncResult({ code: ch.code, role, uid, moves });
-      refresh();
-      onSync();
+      await submitAsyncResult({ code: ch.code, role, uid, moves });
+      await refresh();
+      await onSync();
     } catch (e) {
       setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -327,9 +268,9 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
             </div>
           ) : (
             <>
-              {ch.gameType === 'SCOUT' && <SeededScout seed={ch.seed} onDone={onDone} />}
-              {ch.gameType === 'DOWN' && <SeededDown seed={ch.seed} onDone={onDone} />}
-              {ch.gameType === 'UP' && <SeededUp seed={ch.seed} onDone={onDone} />}
+              {ch.gameType === 'SCOUT' && <SeededScout seed={ch.seed} disabled={submitting} onDone={onDone} />}
+              {ch.gameType === 'DOWN'  && <SeededDown  seed={ch.seed} disabled={submitting} onDone={onDone} />}
+              {ch.gameType === 'UP'    && <SeededUp    seed={ch.seed} disabled={submitting} onDone={onDone} />}
             </>
           )}
           {err && <div className="text-sm text-red-400 mt-3">{err}</div>}
@@ -349,8 +290,8 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
   );
 }
 
-function SeededScout({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRecord[]) => void }) {
-  const grid = useMemo(() => gameGridFromSeed(seed), [seed]);
+function SeededScout({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
+  const grid    = useMemo(() => gameGridFromSeed(seed), [seed]);
   const targets = useMemo(() => { const rnd = prngFromSeed('targets-' + seed); return seededPickUnique(Array.from({ length: 25 }, (_, i) => i + 1), 5, rnd); }, [seed]);
   const { started, live, start } = useGameTimer();
   const [found, setFound] = useState<number[]>([]);
@@ -358,13 +299,12 @@ function SeededScout({ seed, onDone }: { seed: string; onDone: (moves: AsyncMove
   const [moves] = useState<AsyncMoveRecord[]>([]);
 
   const click = (n: number) => {
-    if (!started || done || !targets.includes(n) || found.includes(n)) return;
+    if (!started || done || disabled || !targets.includes(n) || found.includes(n)) return;
     moves.push({ value: n, timestamp: performance.now() });
     const nxt = [...found, n];
     setFound(nxt);
     if (nxt.length === 5) { setDone(true); onDone([...moves]); }
   };
-
   return (
     <div>
       <div className="flex items-center gap-3 mb-4">
@@ -375,13 +315,13 @@ function SeededScout({ seed, onDone }: { seed: string; onDone: (moves: AsyncMove
         {targets.map((t, i) => <span key={i} className={`px-3 py-1 rounded-full text-lg font-bold border ${found.includes(t) ? 'bg-green-500 text-black border-green-500' : 'bg-zinc-900 border-zinc-800'}`}>{t}</span>)}
       </div>
       <div className="grid grid-cols-5 gap-2">
-        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.includes(num) || done} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.includes(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
+        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.includes(num) || done || disabled} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.includes(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
       </div>
     </div>
   );
 }
 
-function SeededDown({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRecord[]) => void }) {
+function SeededDown({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
   const grid = useMemo(() => gameGridFromSeed(seed), [seed]);
   const { started, live, start } = useGameTimer();
   const [next, setNext] = useState(25);
@@ -390,14 +330,11 @@ function SeededDown({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveR
   const [moves] = useState<AsyncMoveRecord[]>([]);
 
   const click = (n: number) => {
-    if (!started || done || n !== next) return;
+    if (!started || done || disabled || n !== next) return;
     moves.push({ value: n, timestamp: performance.now() });
-    const nf = new Set(found).add(n);
-    setFound(nf);
-    if (next === 1) { setDone(true); onDone([...moves]); }
-    else setNext(v => v - 1);
+    const nf = new Set(found).add(n); setFound(nf);
+    if (next === 1) { setDone(true); onDone([...moves]); } else setNext(v => v - 1);
   };
-
   return (
     <div>
       <div className="flex items-center gap-3 mb-4">
@@ -406,13 +343,13 @@ function SeededDown({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveR
         <div className="text-sm text-zinc-400">Next: <span className="font-bold text-white">{done ? '-' : next}</span></div>
       </div>
       <div className="grid grid-cols-5 gap-2">
-        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.has(num) || done} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.has(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
+        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.has(num) || done || disabled} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.has(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
       </div>
     </div>
   );
 }
 
-function SeededUp({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRecord[]) => void }) {
+function SeededUp({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
   const grid = useMemo(() => gameGridFromSeed(seed), [seed]);
   const { started, live, start } = useGameTimer();
   const [next, setNext] = useState(1);
@@ -421,14 +358,11 @@ function SeededUp({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRec
   const [moves] = useState<AsyncMoveRecord[]>([]);
 
   const click = (n: number) => {
-    if (!started || done || n !== next) return;
+    if (!started || done || disabled || n !== next) return;
     moves.push({ value: n, timestamp: performance.now() });
-    const nf = new Set(found).add(n);
-    setFound(nf);
-    if (next === 25) { setDone(true); onDone([...moves]); }
-    else setNext(v => v + 1);
+    const nf = new Set(found).add(n); setFound(nf);
+    if (next === 25) { setDone(true); onDone([...moves]); } else setNext(v => v + 1);
   };
-
   return (
     <div>
       <div className="flex items-center gap-3 mb-4">
@@ -437,7 +371,7 @@ function SeededUp({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRec
         <div className="text-sm text-zinc-400">Next: <span className="font-bold text-white">{done ? '-' : next}</span></div>
       </div>
       <div className="grid grid-cols-5 gap-2">
-        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.has(num) || done} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.has(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
+        {grid.map((num, idx) => <button key={idx} onClick={() => click(num)} disabled={found.has(num) || done || disabled} className={`w-14 h-14 text-xl font-bold rounded-lg ${found.has(num) ? 'bg-green-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}>{num}</button>)}
       </div>
     </div>
   );
@@ -445,44 +379,37 @@ function SeededUp({ seed, onDone }: { seed: string; onDone: (moves: AsyncMoveRec
 
 // ── Connect 4 play ────────────────────────────────────────────────────────────
 
-function Connect4Play({ ch, role, now, onSync, onBack }: { ch: Challenge; role: 'creator' | 'opponent'; now: number; onSync: () => void; onBack: () => void }) {
+function Connect4Play({ ch, now, onSync, onBack }: { ch: Challenge; now: number; onSync: () => Promise<void>; onBack: () => void }) {
   const { uid } = useAuth();
-  const [match, setMatch] = useState<Connect4MatchState | null>(() => readMatch(ch.code) ?? null);
+  const [match, setMatch] = useState<Connect4MatchState | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  // React to board changes via realtime + a light poll fallback.
   useEffect(() => {
-    const pull = () => { const m = readMatch(ch.code); if (m) setMatch({ ...m }); };
-    const unsub = subscribe('match', (signal) => { if (matchesCode(signal, ch.code)) pull(); });
-    const id = setInterval(pull, 1000);
-    return () => { unsub(); clearInterval(id); };
+    let alive = true;
+    const pull = () => { void readMatchAsync(ch.code).then(m => { if (alive && m) setMatch(m); }); };
+    pull();
+    // Subscribed already by the parent's subscribeToChallenge (it filters
+    // connect4_matches by challenge_code), but we also pull on a slow tick.
+    const id = setInterval(pull, 2000);
+    return () => { alive = false; clearInterval(id); };
   }, [ch.code]);
 
   if (!match) return null;
 
   const isMyTurn = ch.phase === 'IN_PROGRESS' && ch.currentTurnUid === uid;
   const deadline = ch.phase === 'WAITING_READY' ? ch.readyDeadlineAt : ch.turnDeadlineAt;
-  const timer = deadline ? formatSeconds(deadline - now) : '--';
-  const myReady = role === 'creator' ? ch.readyCreator : ch.readyOpponent;
+  const timer    = deadline ? formatSeconds(deadline - now) : '--';
+  const myReady  = uid === ch.creatorUid ? ch.readyCreator : ch.readyOpponent;
 
-  const onMove = (col: number) => {
+  const onMove = async (col: number) => {
     setErr(null);
-    try {
-      submitConnect4Move({ code: ch.code, uid, col });
-      onSync();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error');
-    }
+    try { await submitConnect4Move({ code: ch.code, uid, col }); await onSync(); }
+    catch (e) { setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error'); }
   };
-
-  const onReady = () => {
+  const onReady = async () => {
     setErr(null);
-    try {
-      submitConnect4Ready({ code: ch.code, uid, ready: !myReady });
-      onSync();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error');
-    }
+    try { await submitConnect4Ready({ code: ch.code, uid, ready: !myReady }); await onSync(); }
+    catch (e) { setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error'); }
   };
 
   return (
@@ -583,9 +510,7 @@ function ResultView({ ch, role, onBack }: { ch: Challenge; role: string; onBack:
         {snap && (
           <div className="space-y-2 text-sm text-zinc-300">
             <div>Pot: {snap.pot} coins</div>
-            {snap.winnerAmount > 0 && snap.winnerUid && (
-              <div>Winner received: {snap.winnerAmount} coins</div>
-            )}
+            {snap.winnerAmount > 0 && snap.winnerUid && <div>Winner received: {snap.winnerAmount} coins</div>}
             {snap.developerAmount > 0 && <div className="text-zinc-500">Developer fee: {snap.developerAmount}</div>}
             {snap.protocolAmount > 0 && <div className="text-zinc-500">Protocol fee: {snap.protocolAmount}</div>}
             <div className="text-xs text-zinc-500 mt-3 font-mono">TX: {ch.settlementTxId}</div>

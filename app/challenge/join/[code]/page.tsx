@@ -4,7 +4,7 @@ import { useRouter, useParams, useSearchParams } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
 import { useWallet } from '@/contexts/WalletContext';
 import { Shell } from '@/components/ui/Shell';
-import { getChallenge, acceptChallenge, hydrateChallengeFromInvite } from '@/services/challenge.service';
+import { getChallenge, acceptChallenge } from '@/services/challenge.service';
 import { gameTitle, formatSeconds } from '@/lib/format';
 import type { Challenge } from '@/types/challenge';
 
@@ -16,13 +16,16 @@ export default function JoinPage() {
   const router = useRouter();
   const [ch, setCh] = useState<Challenge | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(Date.now());
 
+  // Phase 2: the challenge lives in the DB, so we fetch by code. The legacy
+  // `?invite=` query param is ignored — kept for old shared links.
   useEffect(() => {
-    const invite = params.get('invite');
-    if (invite) hydrateChallengeFromInvite(invite);
-    setCh(getChallenge(code) ?? null);
-  }, [code, params]);
+    let alive = true;
+    void getChallenge(code).then(c => { if (alive) setCh(c ?? null); });
+    return () => { alive = false; };
+  }, [code]);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -34,85 +37,74 @@ export default function JoinPage() {
       <Shell showBack onBack={() => router.push('/arcade')}>
         <div className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5 max-w-xl">
           <h2 className="text-xl font-bold mb-2">Challenge Not Found</h2>
-          <p className="text-sm text-zinc-400">This link may be incomplete. Ask the sender to share the full invite link.</p>
+          <p className="text-sm text-zinc-400">
+            The code may be wrong, or the challenge may have expired. Ask the sender to share a fresh link.
+          </p>
         </div>
       </Shell>
     );
   }
 
-  const onAccept = () => {
+  const onAccept = async () => {
     setErr(null);
 
     if (!authed) {
-      /*
-        FIX BUG 2: redirect after auth goes straight to the play page as opponent,
-        NOT back to the join page (which would show "already accepted" or loop).
-        We also preserve the invite param so hydration still works on the play page
-        if the opponent lands there on a fresh device.
-      */
       const invite = params.get('invite');
       const playUrl = `/challenge/play/${ch.code}?role=opponent${invite ? `&invite=${encodeURIComponent(invite)}` : ''}`;
       router.push(`/auth?redirect=${encodeURIComponent(playUrl)}`);
       return;
     }
 
-    if (ch.stake > balance) { setErr(`Insufficient balance — you have ${balance} coins. Top up first.`); return; }
+    if (ch.stake > balance) {
+      setErr(`Insufficient balance — you have ${balance} coins. Top up first.`);
+      return;
+    }
 
+    setBusy(true);
     try {
-      acceptChallenge({ code: ch.code, uid });
-      refresh();
-      // FIX BUG 2: navigate using ch.code from the hydrated challenge, not from params
+      await acceptChallenge({ code: ch.code, uid });
+      await refresh();
       router.push(`/challenge/play/${ch.code}?role=opponent`);
     } catch (e) {
       setErr(e instanceof Error ? e.message.replace(/_/g, ' ') : 'Error');
+    } finally {
+      setBusy(false);
     }
   };
 
-  const expired = now > ch.expiresAt;
-  const alreadyFunded = ch.status !== 'AWAITING_OPPONENT';
-  const pot = ch.stake * 2;
-  const winnerAmount = Math.floor(pot * (100 - ch.feeStructure.developerFeePct - ch.feeStructure.protocolFeePct) / 100);
+  const isExpired = now > ch.expiresAt;
+  const isSelf = uid && ch.creatorUid === uid;
 
   return (
     <Shell showBack onBack={() => router.push('/arcade')}>
-      <div className="max-w-2xl rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
-        <div className="text-xs uppercase text-yellow-400 mb-2">Challenge Invitation</div>
-        <h1 className="text-3xl font-bold mb-1">{gameTitle(ch.gameType)}</h1>
-        <div className="text-sm text-zinc-400 mb-6">Code: <span className="font-mono">{ch.code}</span></div>
-
-        {ch.creatorUid && (
-          <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 mb-4">
-            <div className="text-sm text-zinc-400">
-              <span className="font-mono text-white">{ch.creatorUid.slice(0, 8)}…</span> has already locked
-            </div>
-            <div className="text-3xl font-bold text-green-400 mt-1">{ch.stake} coins</div>
-          </div>
+      <div className="max-w-xl rounded-2xl border border-zinc-800 bg-zinc-950 p-6">
+        <div className="text-xs uppercase text-zinc-400 mb-1">{gameTitle(ch.gameType)} Challenge</div>
+        <div className="text-3xl font-mono font-bold mb-4">{ch.code}</div>
+        <div className="text-sm text-zinc-300 mb-4">Stake: <span className="font-bold text-white">{ch.stake} coins</span></div>
+        {!isExpired && (
+          <div className="text-xs text-zinc-500 mb-4">Expires in {formatSeconds(ch.expiresAt - now)}</div>
         )}
 
-        <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 mb-4">
-          <div className="text-sm text-zinc-400">To accept, lock</div>
-          <div className="text-3xl font-bold mt-1">{ch.stake} coins</div>
-          <div className="text-xs text-zinc-500 mt-2">
-            Winner receives <span className="text-white font-semibold">{winnerAmount} coins</span>
-            <span className="text-zinc-500"> after {ch.feeStructure.developerFeePct + ch.feeStructure.protocolFeePct}% fee</span>
-          </div>
-        </div>
-
-        {!expired && !alreadyFunded && (
-          <div className="text-xs text-zinc-500 mb-4">
-            Expires in <span className="font-mono text-yellow-300">{formatSeconds(ch.expiresAt - now)}</span>
-          </div>
-        )}
-
-        {expired && <div className="text-sm text-red-400 mb-4">This challenge has expired.</div>}
-        {alreadyFunded && !expired && <div className="text-sm text-yellow-400 mb-4">This challenge has already been accepted.</div>}
-
-        {!expired && !alreadyFunded && (
-          <button onClick={onAccept} className="w-full px-4 py-3 rounded-lg bg-white text-black font-semibold">
-            Lock {ch.stake} coins to Accept
+        {isSelf ? (
+          <div className="text-sm text-yellow-400">This is your challenge. Wait for someone else to accept.</div>
+        ) : isExpired ? (
+          <div className="text-sm text-red-400">This challenge has expired.</div>
+        ) : ch.status !== 'AWAITING_OPPONENT' ? (
+          <button
+            onClick={() => router.push(`/challenge/play/${ch.code}`)}
+            className="px-4 py-2 rounded-lg bg-white text-black font-semibold"
+          >
+            Go to match
+          </button>
+        ) : (
+          <button
+            onClick={onAccept}
+            disabled={busy}
+            className="px-4 py-2 rounded-lg bg-white text-black font-semibold disabled:opacity-60"
+          >
+            {busy ? 'Locking stake…' : `Accept & lock ${ch.stake} coins`}
           </button>
         )}
-
         {err && <div className="text-sm text-red-400 mt-3">{err}</div>}
       </div>
     </Shell>

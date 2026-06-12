@@ -8,8 +8,7 @@ import { CopyableCode } from '@/components/ui/CopyableCode';
 import { useGameTimer } from '@/hooks/useGameTimer';
 import { getChallenge, joinMatch, requestAdjudication } from '@/services/challenge.service';
 import { encodeChallengeInvite } from '@/lib/invite';
-import { submitAsyncResult, submitConnect4Move, submitConnect4Ready, type AsyncMoveRecord } from '@/services/game.service';
-import { gameGridFromSeed, prngFromSeed, seededPickUnique } from '@/lib/prng';
+import { submitAsyncResult, submitConnect4Move, submitConnect4Ready, fetchMatchStart, type AsyncMoveRecord, type MatchStartResponse } from '@/services/game.service';
 import { gameTitle, formatSeconds } from '@/lib/format';
 import type { Challenge } from '@/types/challenge';
 import type { Connect4MatchState } from '@/types/connect4';
@@ -233,6 +232,21 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
   const otherResult = role === 'creator' ? ch.opponentResult : ch.creatorResult;
   const [err, setErr] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [matchStart, setMatchStart] = useState<MatchStartResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // Pull the playable board from the server. Idempotent — same board + same
+  // started_at every call — so it's safe to re-run on reload. The fact that it
+  // records `started_at` is what makes the server-elapsed check work on submit.
+  useEffect(() => {
+    let alive = true;
+    if (yourResult) { setLoading(false); return; }   // already submitted → no fetch
+    fetchMatchStart(ch.code)
+      .then(r => { if (alive) { setMatchStart(r); setErr(null); } })
+      .catch(e => { if (alive) setErr(e instanceof Error ? e.message.replace(/_/g,' ') : 'Error'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [ch.code, yourResult]);
 
   const onDone = async (moves: AsyncMoveRecord[]) => {
     setErr(null); setSubmitting(true);
@@ -266,13 +280,15 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
                 {otherResult ? 'Settling…' : 'Submitted — waiting for opponent to finish their run.'}
               </div>
             </div>
-          ) : (
+          ) : loading ? (
+            <div className="text-sm text-zinc-400">Loading board…</div>
+          ) : matchStart ? (
             <>
-              {ch.gameType === 'SCOUT' && <SeededScout seed={ch.seed} disabled={submitting} onDone={onDone} />}
-              {ch.gameType === 'DOWN'  && <SeededDown  seed={ch.seed} disabled={submitting} onDone={onDone} />}
-              {ch.gameType === 'UP'    && <SeededUp    seed={ch.seed} disabled={submitting} onDone={onDone} />}
+              {ch.gameType === 'SCOUT' && <SeededScout grid={matchStart.grid} targets={matchStart.targets!} disabled={submitting} onDone={onDone} />}
+              {ch.gameType === 'DOWN'  && <SeededDown  grid={matchStart.grid}                              disabled={submitting} onDone={onDone} />}
+              {ch.gameType === 'UP'    && <SeededUp    grid={matchStart.grid}                              disabled={submitting} onDone={onDone} />}
             </>
-          )}
+          ) : null}
           {err && <div className="text-sm text-red-400 mt-3">{err}</div>}
         </div>
         <aside className="rounded-2xl border border-zinc-800 bg-zinc-950 p-5">
@@ -290,9 +306,7 @@ function AsyncPlay({ ch, role, onSync, onBack }: { ch: Challenge; role: 'creator
   );
 }
 
-function SeededScout({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
-  const grid    = useMemo(() => gameGridFromSeed(seed), [seed]);
-  const targets = useMemo(() => { const rnd = prngFromSeed('targets-' + seed); return seededPickUnique(Array.from({ length: 25 }, (_, i) => i + 1), 5, rnd); }, [seed]);
+function SeededScout({ grid, targets, disabled, onDone }: { grid: number[]; targets: number[]; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
   const { started, live, start } = useGameTimer();
   const [found, setFound] = useState<number[]>([]);
   const [done, setDone] = useState(false);
@@ -321,8 +335,7 @@ function SeededScout({ seed, disabled, onDone }: { seed: string; disabled: boole
   );
 }
 
-function SeededDown({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
-  const grid = useMemo(() => gameGridFromSeed(seed), [seed]);
+function SeededDown({ grid, disabled, onDone }: { grid: number[]; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
   const { started, live, start } = useGameTimer();
   const [next, setNext] = useState(25);
   const [found, setFound] = useState<Set<number>>(new Set());
@@ -349,8 +362,7 @@ function SeededDown({ seed, disabled, onDone }: { seed: string; disabled: boolea
   );
 }
 
-function SeededUp({ seed, disabled, onDone }: { seed: string; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
-  const grid = useMemo(() => gameGridFromSeed(seed), [seed]);
+function SeededUp({ grid, disabled, onDone }: { grid: number[]; disabled: boolean; onDone: (m: AsyncMoveRecord[]) => void }) {
   const { started, live, start } = useGameTimer();
   const [next, setNext] = useState(1);
   const [found, setFound] = useState<Set<number>>(new Set());

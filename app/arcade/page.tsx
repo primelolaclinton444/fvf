@@ -5,8 +5,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useWallet } from '@/contexts/WalletContext';
 import { Shell } from '@/components/ui/Shell';
 import { GameCard } from '@/components/ui/GameCard';
-import { listChallenges, hydrateChallengeFromInvite } from '@/services/challenge.service';
-import { checkAndAdjudicate } from '@/services/game.service';
+import { listChallenges, requestAdjudication } from '@/services/challenge.service';
 import { subscribe } from '@/lib/realtime';
 import type { Challenge } from '@/types/challenge';
 
@@ -18,7 +17,6 @@ const TERMINAL = new Set([
   'EXPIRED',
 ]);
 
-// What does this challenge want from the player right now?
 function action(ch: Challenge, uid: string, now: number): { label: string; tone: 'urgent' | 'wait' | 'go' } {
   const isCreator = ch.creatorUid === uid;
   switch (ch.status) {
@@ -29,15 +27,24 @@ function action(ch: Challenge, uid: string, now: number): { label: string; tone:
     case 'FULLY_FUNDED':
     case 'JOIN_WINDOW_STARTED': {
       const youIn = isCreator ? ch.creatorJoined : ch.opponentJoined;
-      return youIn ? { label: 'Waiting for opponent to enter', tone: 'wait' } : { label: 'Enter match now', tone: 'urgent' };
+      return youIn
+        ? { label: 'Waiting for opponent to enter', tone: 'wait' }
+        : { label: 'Enter match now', tone: 'urgent' };
     }
     case 'MATCH_ACTIVE':
       if (ch.gameType === 'CONNECT4') {
-        if (ch.phase === 'IN_PROGRESS') return { label: ch.currentTurnUid === uid ? 'Your turn' : "Opponent's turn", tone: ch.currentTurnUid === uid ? 'urgent' : 'wait' };
+        if (ch.phase === 'IN_PROGRESS') {
+          return {
+            label: ch.currentTurnUid === uid ? 'Your turn' : "Opponent's turn",
+            tone: ch.currentTurnUid === uid ? 'urgent' : 'wait',
+          };
+        }
         return { label: 'Ready up', tone: 'urgent' };
       } else {
         const youDone = isCreator ? ch.creatorResult : ch.opponentResult;
-        return youDone ? { label: 'Waiting for opponent', tone: 'wait' } : { label: 'Play your run', tone: 'urgent' };
+        return youDone
+          ? { label: 'Waiting for opponent', tone: 'wait' }
+          : { label: 'Play your run', tone: 'urgent' };
       }
     default:
       return { label: 'Resume', tone: 'go' };
@@ -51,69 +58,58 @@ export default function ArcadePage() {
   const [active, setActive] = useState<Challenge[]>([]);
   const [now, setNow] = useState(Date.now());
 
-  // Reconcile any of the player's challenges whose deadline has passed, even if
-  // no Play tab was open when it lapsed. This is the failsafe that guarantees
-  // locked stakes are always released — refund, forfeit, or settle as due.
-  const reconcileAndList = useCallback(() => {
-    if (!uid) return;
-    const mine = listChallenges(uid);
+  // Sweep + list. The server cron handles deadlines unconditionally, but firing
+  // adjudicate for visibly-lapsed items shaves the wait for whoever's looking.
+  const reload = useCallback(async () => {
+    if (!uid) { setActive([]); return; }
+    const mine = await listChallenges(uid);
     const t = Date.now();
-    for (const ch of mine) {
-      if (!ch.settled && !TERMINAL.has((ch as any).status)) {
-        try { checkAndAdjudicate(ch.code, t); } catch { /* best-effort */ }
-      }
-    }
-    setActive(listChallenges(uid).filter(c => !TERMINAL.has((c as any).status)));
-    refresh();
+    await Promise.all(
+      mine
+        .filter(c => !c.settled && !TERMINAL.has(c.status) && (c.expiresAt < t || (c.joinDeadlineAt && c.joinDeadlineAt < t) || (c.matchDeadlineAt && c.matchDeadlineAt < t)))
+        .map(c => requestAdjudication(c.code).catch(() => {})),
+    );
+    const fresh = await listChallenges(uid);
+    setActive(fresh.filter(c => !TERMINAL.has(c.status)));
+    await refresh();
   }, [uid, refresh]);
 
-  useEffect(() => { reconcileAndList(); }, [reconcileAndList]);
+  useEffect(() => { void reload(); }, [reload]);
 
-  // Live: refresh the list the instant any challenge changes in another tab.
+  // Live: any challenge change in the DB pulls a fresh list.
   useEffect(() => {
-    const unsub = subscribe('challenge', () => reconcileAndList());
+    const unsub = subscribe('challenge', () => { void reload(); });
     return unsub;
-  }, [reconcileAndList]);
+  }, [reload]);
 
-  // Keep relative timers/labels fresh and keep sweeping while on this page.
+  // Keep relative timers fresh; light cadence since the DB drives state now.
   useEffect(() => {
-    const id = setInterval(() => { setNow(Date.now()); reconcileAndList(); }, 2000);
+    const id = setInterval(() => setNow(Date.now()), 5000);
     return () => clearInterval(id);
-  }, [reconcileAndList]);
+  }, []);
 
   const onJoin = () => {
     if (!code.trim()) return;
     const trimmed = code.trim();
-
     try {
       const u = new URL(trimmed);
-      const invite = u.searchParams.get('invite');
       const pathSegments = u.pathname.split('/').filter(Boolean);
       const codeFromPath =
         pathSegments.length >= 3 && pathSegments[0] === 'challenge' && pathSegments[1] === 'join'
           ? pathSegments[2]
           : null;
-
-      if (codeFromPath && invite) {
-        hydrateChallengeFromInvite(invite);
-        window.location.href = `/challenge/join/${codeFromPath.toUpperCase()}?invite=${encodeURIComponent(invite)}`;
-        return;
-      }
       if (codeFromPath) {
         window.location.href = `/challenge/join/${codeFromPath.toUpperCase()}`;
         return;
       }
-    } catch {
-      // Not a URL — treat as bare code below
-    }
-
+    } catch { /* not a URL — fall through */ }
     window.location.href = `/challenge/join/${trimmed.toUpperCase()}`;
   };
 
   const toneClass: Record<string, string> = {
     urgent: 'text-green-300 border-green-500/40 bg-green-500/10',
-    wait: 'text-yellow-300/90 border-yellow-500/30 bg-yellow-500/5',
-    go: 'text-zinc-300 border-zinc-700 bg-zinc-900',
+    wait:   'text-yellow-300/90 border-yellow-500/30 bg-yellow-500/5',
+    go:     'text-zinc-300 border-zinc-700 bg-zinc-900',
   };
 
   return (
@@ -156,7 +152,7 @@ export default function ArcadePage() {
           />
           <button onClick={onJoin} className="px-4 py-2 rounded-lg bg-white text-black font-semibold">Join</button>
         </div>
-        <p className="text-xs text-zinc-500 mt-2">Paste the full invite link from your opponent — short codes only work on the same device.</p>
+        <p className="text-xs text-zinc-500 mt-2">Paste the invite link or just the code.</p>
       </div>
 
       <h2 className="text-sm uppercase text-zinc-400 mb-3">Create a challenge</h2>

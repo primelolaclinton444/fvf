@@ -1,28 +1,39 @@
 /**
- * Game service — Phase 2 (transitional).
+ * Game service — Step 5.
  *
- * Validation, board updates, and settlement now live on the server. In Step 5
- * (next pair), Edge Functions will re-run the existing TS validators on the
- * server and call thin persist-RPCs (`record_async_result`, `record_connect4_move`).
- *
- * For Steps 3+4 we keep the *function names* the play page already uses, but
- * route them through RPCs/Edge calls. Async submit currently calls the
- * persist-RPC directly (because RLS denies direct table writes anyway, the
- * worst a tampered client can do is fail validation in Step 5). Connect 4
- * moves go through the existing `enter_match` / `connect4_ready` RPCs and the
- * `record_connect4_move` RPC. All functions are async now.
+ * No more client-side board derivation or winner detection. Both async
+ * submission and Connect 4 moves now hit Edge Functions that re-derive
+ * everything server-side and call the persist-RPCs themselves. The client's
+ * only inputs are: the challenge code, the column or move sequence, and the
+ * timestamps it observed.
  */
 import type { Challenge } from '@/types/challenge';
 import { supabase } from '@/lib/supabase';
 import { rowToChallenge } from '@/lib/db-mappers';
-import { applyMove, detectWinner, isDraw, type Connect4Board, type Connect4Player } from '@/lib/connect4/engine';
 import { requestAdjudication, readyUp } from './challenge.service';
 
 export type AsyncMoveRecord = { value: number; timestamp: number };
 
-const MIN_PLAUSIBLE_MS = 500;
+export type MatchStartResponse = {
+  startedAt: string;          // ISO server timestamp
+  grid: number[];             // 25 ints
+  targets?: number[];         // SCOUT only
+  gameType: 'SCOUT' | 'DOWN' | 'UP';
+};
 
-// ── Async submit ─────────────────────────────────────────────────────────────
+/**
+ * Ask the server for the playable board + targets. Idempotent: the server
+ * stamps `started_at` on the first call only, so a reload returns the same
+ * timestamp and the same board. Call this BEFORE the player starts playing —
+ * the timestamp is what the server-elapsed check uses on submit.
+ */
+export async function fetchMatchStart(code: string): Promise<MatchStartResponse> {
+  const { data, error } = await supabase.functions.invoke<MatchStartResponse>('match-start', {
+    body: { code: code.toUpperCase() },
+  });
+  if (error || !data) throw new Error(error?.message ?? 'MATCH_START_FAILED');
+  return data;
+}
 
 export async function submitAsyncResult(input: {
   code: string;
@@ -30,78 +41,28 @@ export async function submitAsyncResult(input: {
   uid: string;
   moves: AsyncMoveRecord[];
 }): Promise<Challenge> {
-  const { code, uid, moves } = input;
-  if (moves.length < 2) throw new Error('NO_MOVES');
-  const finalMs = moves[moves.length - 1].timestamp - moves[0].timestamp;
-  if (finalMs < MIN_PLAUSIBLE_MS) throw new Error('IMPLAUSIBLE_TIME');
-
-  // Persist via RPC. The server settles automatically when both players are in.
-  // Step 5 inserts an Edge Function in front of this that re-runs the seed and
-  // validates move legality before this RPC ever runs.
-  const { data, error } = await supabase.rpc('record_async_result', {
-    p_code: code.toUpperCase(),
-    p_player: uid,
-    p_moves: moves,
-    p_final_ms: finalMs,
+  const { data, error } = await supabase.functions.invoke<{ challenge: any; error?: string }>('submit-async', {
+    body: { code: input.code.toUpperCase(), moves: input.moves },
   });
   if (error) throw new Error(error.message);
-  return rowToChallenge(Array.isArray(data) ? data[0] : data);
+  if (!data || (data as any).error) throw new Error((data as any)?.error ?? 'SUBMIT_FAILED');
+  return rowToChallenge(Array.isArray(data.challenge) ? data.challenge[0] : data.challenge);
 }
-
-// ── Connect 4 move ───────────────────────────────────────────────────────────
 
 export async function submitConnect4Move(input: { code: string; uid: string; col: number }): Promise<Challenge> {
-  const { code, uid, col } = input;
-
-  // Read current board, apply locally to get the next board + winner/draw, then
-  // hand it to the persist-RPC. Step 5 replaces this client-side computation
-  // with an Edge Function that re-derives the next board from the move log and
-  // rejects anything inconsistent.
-  const { data: matchRow, error: mErr } = await supabase
-    .from('connect4_matches')
-    .select('board_state')
-    .eq('challenge_code', code.toUpperCase())
-    .maybeSingle();
-  if (mErr || !matchRow) throw new Error('MATCH_NOT_FOUND');
-
-  const { data: chRow, error: cErr } = await supabase
-    .from('challenges')
-    .select('creator_id, opponent_id, current_turn_id')
-    .eq('code', code.toUpperCase())
-    .maybeSingle();
-  if (cErr || !chRow) throw new Error('CHALLENGE_NOT_FOUND');
-  if (chRow.current_turn_id !== uid) throw new Error('NOT_YOUR_TURN');
-
-  const player: Connect4Player = uid === chRow.creator_id ? 1 : 2;
-  const board: Connect4Board = (matchRow.board_state ?? []) as Connect4Board;
-  const { board: next } = applyMove(board, col, player);      // throws on illegal col
-  const winner = detectWinner(next);
-  const winnerUid: string | null = winner === 1 ? chRow.creator_id : winner === 2 ? chRow.opponent_id : null;
-  const draw = !winner && isDraw(next);
-
-  const { data, error } = await supabase.rpc('record_connect4_move', {
-    p_code: code.toUpperCase(),
-    p_actor: uid,
-    p_col: col,
-    p_board: next as unknown as number[],
-    p_winner: winnerUid,
-    p_draw: draw,
+  const { data, error } = await supabase.functions.invoke<{ challenge: any; error?: string }>('connect4-move', {
+    body: { code: input.code.toUpperCase(), col: input.col },
   });
   if (error) throw new Error(error.message);
-  return rowToChallenge(Array.isArray(data) ? data[0] : data);
+  if (!data || (data as any).error) throw new Error((data as any)?.error ?? 'MOVE_FAILED');
+  return rowToChallenge(Array.isArray(data.challenge) ? data.challenge[0] : data.challenge);
 }
 
-// ── Ready / adjudicate — thin wrappers so the play page imports stay the same ─
-
+// Ready/adjudicate are unchanged from Step 3+4 — they call RPCs directly.
 export async function submitConnect4Ready(input: { code: string; uid: string; ready: boolean }): Promise<Challenge> {
   return readyUp(input);
 }
 
-/**
- * Opportunistic, client-side hint: ask the server to adjudicate this challenge
- * now. `pg_cron` does the same thing every 15s anyway, so this is purely a
- * latency reduction for users who happen to be looking at the page.
- */
 export async function checkAndAdjudicate(code: string, _now: number): Promise<void> {
   await requestAdjudication(code);
 }
